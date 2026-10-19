@@ -1,0 +1,71 @@
+# --- Secrets: never commit these ------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+kubeconfig
+*.kubeconfig
+# Real Secret values / overrides (charts reference Secrets by name; values go in the cluster, not git)
+values-secret*.yaml
+*-secrets.yaml
+secrets/
+
+# --- Local databases and runtime files ------------------------------------------
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+# Incident fallback logs written by the gateway (GATEWAY_INCIDENT_LOG)
+incidents*.jsonl
+*.log
+
+# --- Python -----------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# --- Node / dashboard ---------------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/build/
+.vite/
+
+# --- Helm / Kubernetes build output --------------------------------------------------
+*.tgz
+charts/*.tgz
+deploy/helm/*/charts/*.tgz
+deploy/helm/*/Chart.lock
+
+# --- Editors and OS --------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+Thumbs.db
+
+# --- Claude Code: personal, machine-specific settings ----------------
+.claude/settings.local.json
+.claude/projects/
+CLAUDE.md
+
+# --- Local Notes ---
+Problem_Statement.pdf
+Client_PLAN.md
+Kubernetes_Helm.md
+MCP_Endpoint.md
+status_code.md
+WooCommerce_MCP_Server.md
