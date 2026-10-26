@@ -27,7 +27,7 @@ the servers' credentials, and every tool call is in an audit log.
 | Docker Compose store used for the early contract tests | `deploy/compose/` |
 
 Documents: [System design and trade-offs](docs/design.md) · [Threat model](docs/threat-model.md) ·
-[Demo steps](docs/demo-steps.md) · [Status codes and error meanings](Status_Codes.md) · [Script reference](scripts/README.md)
+[Status codes and error meanings](Status_Codes.md) · [Script reference](scripts/README.md)
 
 ---
 
