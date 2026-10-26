@@ -1,0 +1,65 @@
+# Defaults shared by every environment. Environment differences go in values-local.yaml / values-prod.yaml.
+# No secret value belongs in any values file: the chart refers to Secrets by name (see "secrets").
+
+storeName: main            # used in names and labels; the namespace is chosen at install time (store-<name>)
+
+# Where the store is reached from outside. WordPress redirects any other host name to this one.
+host: ""                   # set per environment, e.g. shop.192.168.1.11.sslip.io
+scheme: http               # http locally; https in production
+timezone: Asia/Kolkata
+
+site:
+  title: WooCommerce Store
+  adminUser: admin
+  adminEmail: admin@example.com
+
+ingress:
+  className: traefik
+  tls:
+    enabled: false          # production: true, with a Secret holding the certificate (e.g. made by cert-manager)
+    secretName: ""
+  annotations: {}
+
+# NetworkPolicies: everything is denied unless allowed in templates/networkpolicy.yaml. The selectors name pods in
+# OTHER namespaces that may reach this store; they must match the labels those charts put on their pods.
+networkPolicy:
+  enabled: true
+  ingressController:
+    namespace: kube-system                       # k3s/k3d ship Traefik here
+    podLabels: { app.kubernetes.io/name: traefik }
+  gateway:
+    namespace: platform
+    podLabels: { app.kubernetes.io/name: gateway }
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
+
+images:
+  mariadb:   { repository: mariadb,   tag: "11",             pullPolicy: IfNotPresent }   # TODO pin an exact tag/digest (read it from the HP: docker image inspect)
+  wordpress: { repository: wordpress, tag: 7.1.3-apache,     pullPolicy: IfNotPresent }
+  wpcli:     { repository: wordpress, tag: cli,              pullPolicy: IfNotPresent }   # TODO pin an exact tag/digest, as for mariadb
+  mcp:       { repository: woo-mcp,   tag: dev,              pullPolicy: IfNotPresent }
+woocommerceVersion: "11.2.1"
+
+storage:
+  className: ""            # empty = the cluster default (k3s: local-path)
+  dbSize: 5Gi
+  wordpressSize: 5Gi
+
+# Names of Secrets that scripts/bootstrap-secrets.sh creates. The chart never contains their values.
+secrets:
+  db: store-db                 # DB_PASSWORD, DB_ROOT_PASSWORD
+  wordpress: store-wordpress   # WP_ADMIN_PASSWORD, WC_CONSUMER_KEY, WC_CONSUMER_SECRET
+  mcp: store-mcp               # MCP_SERVER_TOKEN (the same value is also created in the platform namespace)
+
+# Every container gets explicit requests and limits.
+resources:
+  mariadb:   { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 500m,  memory: 512Mi } }
+  wordpress: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 1000m, memory: 768Mi } }
+  setup:     { requests: { cpu: 50m,  memory: 256Mi }, limits: { cpu: 500m,  memory: 768Mi } }   # WP-CLI loads all of WordPress + WooCommerce: 256Mi was OOMKilled on the HP
+  mcp:       { requests: { cpu: 50m,  memory: 96Mi  }, limits: { cpu: 250m,  memory: 192Mi } }
+
+# Namespace-wide defaults for any container that forgets its own requests/limits.
+limitRange:
+  default:        { cpu: 250m, memory: 256Mi }   # limit applied when a container sets none
+  defaultRequest: { cpu: 50m,  memory: 64Mi }    # request applied when a container sets none

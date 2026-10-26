@@ -1,0 +1,55 @@
+:root { font-family: system-ui, sans-serif; color: #1d2433; background: #f5f6f8; }
+body { margin: 0; }
+button { cursor: pointer; padding: 6px 12px; border: 1px solid #c8ccd4; border-radius: 6px; background: white; }
+button:disabled { opacity: .5; cursor: default; }
+button.danger { color: #b42318; border-color: #f0b4ae; }
+button.link { border: none; background: none; color: #2457c5; padding: 2px 6px; }
+input, select { padding: 6px 8px; border: 1px solid #c8ccd4; border-radius: 6px; font: inherit; }
+code { background: #eef0f4; padding: 1px 5px; border-radius: 4px; font-size: .9em; word-break: break-all; }
+table { width: 100%; border-collapse: collapse; background: white; margin: 8px 0 16px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #e6e8ec; vertical-align: top; font-size: .92em; }
+
+header { display: flex; align-items: center; gap: 16px; padding: 10px 20px; background: #1d2433; color: white; flex-wrap: wrap; }
+header nav { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+.tab { background: transparent; color: #cfd5e1; border: none; }
+.tab.active { background: #36415a; color: white; }
+.who { display: flex; align-items: center; gap: 8px; font-size: .9em; }
+.who .link { color: #cfd5e1; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px 20px 40px; }
+
+.card { background: white; border: 1px solid #e1e4ea; border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
+form.card label { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; font-size: .9em; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.between { justify-content: space-between; }
+.hint { color: #5d6678; font-size: .88em; }
+.small { font-size: .85em; }
+.muted { color: #8a92a3; }
+.error { color: #b42318; }
+.badge { background: #36415a; padding: 1px 8px; border-radius: 10px; font-size: .8em; }
+
+.status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: .8em; font-weight: 600; }
+.status.connected { background: #dcf5e3; color: #146c2e; }
+.status.unreachable { background: #fde4e1; color: #b42318; }
+.status.disabled { background: #e6e8ec; color: #5d6678; }
+.outcome.success { color: #146c2e; }
+.outcome.error, .outcome.auth_failed, .outcome.denied { color: #b42318; }
+.tools { margin: 6px 0 0; padding-left: 18px; font-size: .9em; }
+.tools li { margin: 3px 0; }
+
+.once { background: #fff8e1; border: 1px solid #f1d27a; border-radius: 8px; padding: 12px; margin: 10px 0; }
+.once code { display: block; padding: 8px; margin: 8px 0; }
+
+.login { max-width: 420px; margin: 12vh auto; background: white; padding: 24px; border-radius: 10px; border: 1px solid #e1e4ea; }
+.login form { display: flex; gap: 8px; }
+.login input { flex: 1; }
+
+.chat .turns { display: flex; flex-direction: column; gap: 10px; margin: 12px 0; }
+.turn { max-width: 80%; }
+.turn.user { align-self: flex-end; }
+.bubble { background: white; border: 1px solid #e1e4ea; border-radius: 10px; padding: 8px 12px; white-space: pre-wrap; }
+.turn.user .bubble { background: #2457c5; color: white; border-color: #2457c5; }
+.toolcalls { font-size: .85em; margin-bottom: 4px; color: #5d6678; }
+.toolcall pre { background: #eef0f4; padding: 6px; border-radius: 4px; max-height: 160px; overflow: auto; white-space: pre-wrap; }
+.chat form input { flex: 1; }
+
+.selectable { user-select: all; cursor: text; }

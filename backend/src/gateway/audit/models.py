@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import DateTime, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -25,4 +25,17 @@ class AuditRow(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     outcome: Mapped[str] = mapped_column(String(12), index=True)
     error_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    source: Mapped[str] = mapped_column(String(8))  # "mcp" | "chat"
+    source: Mapped[str] = mapped_column(String(8))  # "mcp" | "chat" | "api" (dashboard login)
+
+
+class AdminEventRow(Base):
+    """A change to the gateway's own configuration (not a tool call). Never stores secret values:
+    only which fields changed, and old/new URLs with credentials and query strings removed."""
+
+    __tablename__ = "admin_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    actor: Mapped[str] = mapped_column(String(254))  # "system:seed", or an admin's email
+    action: Mapped[str] = mapped_column(String(40), index=True)  # server_created | server_updated | ...
+    server_slug: Mapped[str | None] = mapped_column(String(63), nullable=True, index=True)
+    details: Mapped[str] = mapped_column(Text, default="{}")  # JSON: changed fields, safe old/new values

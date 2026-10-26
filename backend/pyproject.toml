@@ -1,10 +1,10 @@
 [project]
 name = "mcp-gateway-backend"
 version = "0.1.0"
+authors = [{ name = "Prachi" }]
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp",
-    "fastapi",
     "uvicorn",
     "httpx",
     "sqlalchemy",

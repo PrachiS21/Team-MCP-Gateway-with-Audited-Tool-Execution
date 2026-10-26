@@ -1,0 +1,9 @@
+host: app.192.168.1.11.sslip.io
+scheme: http        # Known limitation: plain HTTP locally (no TLS), so keys and the session cookie cross the LAN
+                    # unencrypted. values-prod.yaml uses https + TLS + a Secure cookie. See `docs/threat-model.md`.
+images:
+  gateway: { repository: gateway, tag: dev, pullPolicy: IfNotPresent }
+# The chat agent: set a tool-calling model of your provider (the base URL defaults to Groq's OpenAI-compatible API),
+# then store the key with scripts/set-llm-key.sh and run scripts/deploy-local.sh.
+llm:
+  model: openai/gpt-oss-120b      # Groq; fallback with higher free-tier limits: openai/gpt-oss-20b

@@ -18,8 +18,17 @@ class IncidentLog:
         self._path = fallback_path
 
     def emit(self, event: str, details: dict[str, Any]) -> None:
+        """Something went wrong and may need a human: logged at CRITICAL."""
+        self._write(logging.CRITICAL, event, details)
+
+    def notice(self, event: str, details: dict[str, Any]) -> None:
+        """Something an admin should know about but that is not a failure (e.g. a configuration change
+        applied at startup): logged at WARNING so it shows in `kubectl logs` without alarming anyone."""
+        self._write(logging.WARNING, event, details)
+
+    def _write(self, level: int, event: str, details: dict[str, Any]) -> None:
         record = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **details}
-        _log.critical(json.dumps(record))
+        _log.log(level, json.dumps(record))
         if self._path is not None:
             try:
                 with self._path.open("a") as f:

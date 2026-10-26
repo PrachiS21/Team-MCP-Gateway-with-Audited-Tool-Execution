@@ -1,0 +1,67 @@
+{{- if .Values.dashboard.enabled }}
+# The React dashboard: static files behind an unprivileged nginx. It holds no secrets and calls nothing itself; the
+# browser talks to /api and /mcp on the same host, and the Ingress sends those to the gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: dashboard
+spec:
+  selector:
+    app.kubernetes.io/name: dashboard
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "platform.labels" . | nindent 8 }}
+        app.kubernetes.io/name: dashboard
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101           # the "nginx" user of the unprivileged nginx image
+        runAsGroup: 101
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: dashboard
+          image: {{ include "platform.image" .Values.images.dashboard }}
+          imagePullPolicy: {{ .Values.images.dashboard.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 8080 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }   # nginx's pid file and temporary files
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources.dashboard | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
+{{- end }}

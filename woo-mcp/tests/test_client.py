@@ -158,3 +158,17 @@ async def test_ping():
     assert await client(Store((200, []))).ping() is True
     assert await client(Store((401, {}))).ping() is False
     assert await client(Store(httpx.ConnectError("x"))).ping() is False
+
+
+@pytest.mark.parametrize("status, message", [(400, "ID is invalid."), (400, "Invalid ID."), (404, "Invalid ID."), (400, "id is invalid")])
+async def test_the_real_stores_unknown_id_replies_become_not_found(status, message):
+    """Seen against a real WooCommerce: an unknown order id answers 400 "ID is invalid." instead of 404."""
+    with pytest.raises(WooError) as e:
+        await client(Store((status, {"code": "rest_invalid_param", "message": message}))).update_order(99, {"status": "completed"})
+    assert e.value.kind == "not_found" and e.value.message == "Order 99 not found."
+
+
+async def test_other_400_messages_are_still_passed_on_as_invalid():
+    with pytest.raises(WooError) as e:
+        await client(Store((400, {"message": "Invalid parameter(s): status"}))).update_order(1, {"status": "bogus"})
+    assert e.value.kind == "invalid" and "status" in e.value.message

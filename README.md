@@ -1,351 +1,192 @@
-# WooCommerce MCP Gateway
+# WooCommerce MCP Gateway on Kubernetes
 
-A team gateway for [Model Context Protocol (MCP)](https://modelcontextprotocol.io) servers, with a WooCommerce store as its first data source.
+**Author:** Prachi.
 
-An admin registers MCP servers once. Every team member then reaches all of them through **one MCP endpoint** with their **own API key**, without ever seeing the upstream credentials. Every tool call is attributed to a user and written to an audit log.
+A WooCommerce store on Kubernetes, with a **team MCP gateway** in front of every MCP server the team uses. An admin
+registers each server once in a dashboard. Every team member then uses all of them through **one MCP endpoint and their
+own API key**, from Claude Code, Cursor or MCP Inspector, or through a **chat agent in the dashboard**. Members never see
+the servers' credentials, and every tool call is in an audit log.
 
-> **Status:** the gateway, the WooCommerce MCP server and their tests are built and run locally. The Kubernetes/Helm deployment, the real WooCommerce store, the dashboard and the chat agent are not built yet. See [Status](#status).
+```
+ Browser: dashboard + chat ─┐                      ┌─► gateway ─┬─► woo-mcp ─► WordPress + WooCommerce ─► MariaDB
+ Claude Code / Cursor ──────┼─► Ingress (Traefik) ─┤            ├─► gst (GST calculator)
+ Storefront shoppers ───────┘                      │            ├─► everything (official MCP reference server)
+                                                   │            └─► LLM API (chat only)
+                                                   ├─► dashboard (static React app)
+                                                   └─► WordPress (storefront)
+```
+
+| Part | Folder |
+|---|---|
+| Gateway: MCP endpoint, admin API, audit log, chat agent | `backend/` |
+| WooCommerce MCP server (written for this project) | `woo-mcp/` |
+| Two more upstream servers: `gst` (mine), `everything` (official reference server) | `upstreams/` |
+| Dashboard (React) | `frontend/` |
+| Helm charts: `store` and `platform`, with `values-local.yaml` / `values-prod.yaml` | `deploy/helm/` |
+| Scripts: cluster, images, secrets, deploy, demo client | `scripts/` |
+| Docker Compose store used for the early contract tests | `deploy/compose/` |
+
+Documents: [System design and trade-offs](docs/design.md) · [Threat model](docs/threat-model.md) ·
+[Demo steps](docs/demo-steps.md) · [Status codes and error meanings](Status_Codes.md) · [Script reference](scripts/README.md)
 
 ---
 
-## Contents
-- [Architecture](#architecture)
-- [Status](#status)
-- [Repository layout](#repository-layout)
-- [Prerequisites](#prerequisites)
-- [Setup](#setup)
-- [Run the gateway](#run-the-gateway)
-- [Try it: register a server and call a tool](#try-it-register-a-server-and-call-a-tool)
-- [Run the WooCommerce MCP server](#run-the-woocommerce-mcp-server)
-- [Connect an MCP client](#connect-an-mcp-client)
-- [Admin command reference](#admin-command-reference)
-- [Configuration](#configuration)
-- [Run the tests](#run-the-tests)
-- [Design notes](#design-notes)
-- [Security model](#security-model)
-- [Troubleshooting](#troubleshooting)
+## Local setup (k3d)
+I run the cluster on an Ubuntu laptop (16 GB RAM, amd64) and edit the code on a Mac on the same network. One machine
+works too: skip the sync step.
+
+**Needs on the cluster machine:** Docker, [k3d](https://k3d.io), kubectl, Helm (3 or 4), and about 25 GB of free disk on
+a 100 GB disk (Kubernetes stops starting pods when free space falls below about 15%). `scripts/README.md` lists install
+commands.
+
+```bash
+# from the machine with the code, if it is not the cluster machine (secrets, .venv and databases are left behind)
+scripts/sync-to-hp.sh user@<cluster-machine-ip>       # copies to ~/wc-platform
+
+# on the cluster machine
+cd ~/wc-platform
+scripts/k3d-up.sh               # cluster "wc"; ports 80 and 443 of this machine go to Traefik
+scripts/build-images.sh         # builds the 5 images here and imports them into the cluster
+scripts/bootstrap-secrets.sh    # namespaces and random Secrets, written straight into the cluster
+scripts/set-llm-key.sh          # optional: the chat agent's LLM key (hidden prompt)
+scripts/deploy-local.sh         # installs the store chart, then the platform chart
+```
+The first deploy downloads WooCommerce (a few minutes). `deploy-local.sh` prints the addresses:
+
+| | Address |
+|---|---|
+| Storefront | `http://shop.<ip>.sslip.io` (WooCommerce admin: `/wp-admin`, user `admin`) |
+| Dashboard | `http://app.<ip>.sslip.io` |
+| MCP endpoint | `http://app.<ip>.sslip.io/mcp` |
+
+**The local domain approach.** [sslip.io](https://sslip.io) is a public DNS service in which `shop.192.168.1.11.sslip.io`
+resolves to `192.168.1.11`. So the Ingress gets stable host names that every device on the network can use, with no
+hosts-file editing and no DNS server of my own. The IP comes from `deploy-local.sh`, which detects it (override with
+`HOST_IP=…`); if the machine's address changes, run it again. Local traffic is plain HTTP (see the threat model).
+
+**The first admin's API key** is printed once, when the gateway starts for the first time:
+```bash
+kubectl -n platform logs deploy/gateway | grep -A3 "First admin"
+```
+Store it in a password manager. If it is lost:
+`kubectl -n platform exec -it deploy/gateway -- gateway-admin issue-key admin@example.com --name dashboard`.
+
+**The WordPress admin password:**
+```bash
+kubectl -n store-main get secret store-wordpress -o jsonpath='{.data.WP_ADMIN_PASSWORD}' | base64 -d; echo
+```
+
+**Chat agent.** Uses any OpenAI-compatible API; set the model in `deploy/helm/platform/values-local.yaml` (`llm.model`,
+default base URL Groq's) and the key with `scripts/set-llm-key.sh`. Without a model or key, the chat answers
+"not configured" and everything else works.
+
+**After changing code:** sync, then `scripts/build-images.sh` (it restarts the affected pods). After changing charts or
+values: `scripts/deploy-local.sh`. To remove everything: `scripts/teardown.sh` (asks before deleting data).
+
+## Production-like setup (VPS with k3s)
+Same charts; only values change. I have not deployed it to a VPS yet; these are the steps.
+
+1. **Server and DNS.** A VPS with k3s (`curl -sfL https://get.k3s.io | sh -`; Traefik and `local-path` storage come
+   with it). DNS A records for `shop.<domain>` and `app.<domain>` pointing to it.
+2. **Images.** Build the five images (`backend/`, `woo-mcp/`, `upstreams/gst/`, `upstreams/everything/`, `frontend/`)
+   for the server's architecture, push them to a registry, and set `images.*` (and the `upstreams[].image` entries) in
+   the `values-prod.yaml` files to those names with pinned tags.
+3. **TLS.** Install cert-manager (or bring certificates) so the Secrets `store-main-tls` and `platform-tls` exist; the
+   prod values turn on TLS on both Ingresses and mark the session cookie `Secure`.
+4. **Values.** Set `host` in both `values-prod.yaml` files to the real names, and `llm.model` if the chat is wanted.
+5. **Secrets.** The local scripts refuse any cluster but the local k3d one, on purpose. Create the same Secrets with
+   `kubectl create secret generic`: in `store-main`, `store-db` (`DB_PASSWORD`, `DB_ROOT_PASSWORD`), `store-wordpress`
+   (`WP_ADMIN_PASSWORD`, `WC_CONSUMER_KEY`, `WC_CONSUMER_SECRET`), `store-mcp` (`MCP_SERVER_TOKEN`); in `platform`,
+   `gateway-secrets` (`GATEWAY_SECRET_KEY`, a Fernet key; `WOO_MCP_TOKEN`, the same value as `MCP_SERVER_TOKEN`;
+   `GST_MCP_TOKEN`; optional `LLM_API_KEY`). Or use an external secrets manager: the charts only reference Secrets by
+   name.
+6. **Install:**
+   ```bash
+   helm upgrade --install store deploy/helm/store -n store-main -f deploy/helm/store/values-prod.yaml --wait --wait-for-jobs --timeout 15m
+   helm upgrade --install platform deploy/helm/platform -n platform -f deploy/helm/platform/values-prod.yaml --wait --timeout 10m
+   ```
+What changes from local: domain and DNS, TLS, image registry, larger PVCs and resources, the storage class if the
+provider has a better one, how Secrets are created. Details: [docs/design.md](docs/design.md#local-versus-production).
+
+**Upgrade and rollback:** `helm upgrade` as above (failed upgrades roll back with `--rollback-on-failure`, Helm 4, or
+`--atomic`, Helm 3); `helm history <release> -n <ns>`; `helm rollback <release> <revision> -n <ns>`. Volumes keep their
+data through both.
 
 ---
 
-## Architecture
+## How to use it
 
-```
-                                        ┌──────────────────────────────────────────────┐
-  Claude Code / Cursor /                │                  GATEWAY                     │
-  MCP Inspector ── API key ───────────► │  MCP server  ← clients connect here          │
-                                        │  Auth        hashed API keys, roles          │
-  (later) dashboard chat agent ───────► │  Audit log   user · server · tool · outcome  │
-                                        │  Undo worker reverses actions it can't log   │
-                                        │  Manager     merge · namespace · route       │
-                                        │  Clients     one per upstream, own timeouts  │
-                                        │  Registry    servers + encrypted credentials │
-                                        └───────┬──────────────────┬───────────────────┘
-                              Streamable HTTP + │ stored credential│
-                                                ▼                  ▼
-                                 ┌─────────────────────┐   ┌──────────────┐
-                                 │ WooCommerce MCP     │   │ Any other    │
-                                 │ server (this repo)  │   │ MCP server   │
-                                 └──────────┬──────────┘   └──────────────┘
-                                            │ WooCommerce REST API (consumer key)
-                                            ▼
-                                     WooCommerce store
-```
+### Place an order
+Open the storefront, add a product to the cart, check out with **Cash on delivery**. It appears in WooCommerce admin
+under **WooCommerce → Orders**, and in `woo__list_orders` with "today" computed in the store's time zone (IST).
 
-**How a tool call travels:** the client sends `woo__list_orders` with its API key → the gateway hashes and checks the key → the manager resolves the `woo` prefix to a registered server → that server's client calls it with the gateway's *own* stored credential and a timeout → the result comes back and an audit row is written.
+### Team members and keys
+- Admin, in the dashboard → **Members**: **Invite** creates a member and shows their first API key once; **Issue new
+  key** gives an existing member another; keys can be revoked; members can be deactivated.
+- A member logs in to the dashboard with their key and creates more under **My API keys** (one per device or tool, so
+  one can be revoked without the others).
 
-**Key properties**
-- **Name collisions:** tools are exposed as `<slug>__<tool>`, so two servers that both have `search` become `docs__search` and `woo__search`.
-- **Failure isolation:** a slow or dead server adds no tools and its calls return a clear error. Other servers are unaffected.
-- **No credential leaks:** upstream credentials stay on the gateway. A client's key is never forwarded upstream.
-- **Every call audited:** a write-ahead row is written before each call. If the final write fails after a state-changing call, the action is queued for automatic reversal.
+### Connect an external MCP client
+Only the gateway URL and the member's key are needed.
+- **Claude Code:**
+  `claude mcp add --transport http gateway http://app.<ip>.sslip.io/mcp --header "Authorization: Bearer <key>"`
+  then `/mcp` shows the tools of every enabled server. (`scripts/demo-user-b.sh setup` does this with a hidden prompt,
+  for a separate demo folder.)
+- **Cursor / other clients:** Streamable HTTP transport, URL `…/mcp`, header `Authorization: Bearer <key>`.
+- **MCP Inspector:** `npx @modelcontextprotocol/inspector`, transport Streamable HTTP, same URL and header.
 
-## Status
+Tools are named `<server>__<tool>`: `woo__list_orders`, `woo__create_product`, `gst__calculate_gst`,
+`everything__get-sum`, and so on. Example prompts: *What orders came in today?* · *How much GST is included in today's
+orders? Get the totals from the store, then use the GST calculator.*
 
-| Component | State |
-|---|---|
-| Gateway MCP endpoint (`/mcp`), health endpoints | Built, tested |
-| Upstream client and manager (routing, timeouts, collisions) | Built, tested |
-| Server registry with encrypted credentials and URL (SSRF) checks | Built, tested |
-| Users, roles, hashed revocable API keys | Built, tested |
-| Audit log and write-ahead recording | Built, tested |
-| Async undo of unrecorded actions (retries, locks, conflict detection) | Built, tested |
-| Admin CLI (`gateway-admin`) | Built, tested |
-| WooCommerce MCP server (7 tools) | Built, tested against a **fake** WooCommerce API |
-| Real WooCommerce store on Kubernetes | Not built |
-| Helm charts, Ingress, NetworkPolicies, probes, Secrets | Not built |
-| React dashboard (admin UI) | Not built |
-| Chat agent (LLM tool loop) | Not built |
-| Two further example upstream servers | Not built |
+### Use the chat agent
+Dashboard → **Chat**. Ask *Create a product called "Lego Crown" priced at 1299 rupees*, or *What orders came in today?*
+Each answer lists the tool calls it made (expand to see arguments and results). The agent acts as the logged-in user: its calls
+are in the audit log under that user's name with source `chat`.
 
-Behaviours that need a real store (key authentication over in-cluster HTTP, order date-filter semantics, WooCommerce install automation) are verified only against the fake so far.
+### Admin controls
+- **Servers:** live status (Connected / Unreachable / Disabled) and tools of each; add a server by URL with an optional
+  bearer token or custom header; edit, disable, enable, remove. The WooCommerce server is registered at startup.
+- **Audit log:** every call with user, key, server, tool, time, duration, outcome and source; filterable. Members see
+  only their own. Configuration changes are listed below it.
+- Command line inside the gateway pod: `kubectl -n platform exec deploy/gateway -- gateway-admin --help`.
 
-## Repository layout
+---
 
-```
-.
-├── backend/                 the gateway (Python, FastMCP)
-│   ├── src/gateway/
-│   │   ├── server.py        MCP endpoint, key verifier, startup wiring
-│   │   ├── service.py       one place that routes and audits every call
-│   │   ├── mcp/             upstream client + manager (routing, timeouts)
-│   │   ├── registry/        saved servers, credential encryption, URL policy
-│   │   ├── auth/            users, API keys
-│   │   ├── audit/           audit log
-│   │   ├── jobs.py          durable undo-job store
-│   │   ├── undo_worker.py   background reversal of unrecorded actions
-│   │   ├── compensation.py  undo rules and hidden internal tools
-│   │   ├── woo_compensation.py  undo rules for the WooCommerce server
-│   │   └── cli.py           gateway-admin
-│   ├── scripts/             demo upstream, reference spike
-│   └── tests/
-├── woo-mcp/                 the WooCommerce MCP server (separate project, own dependencies)
-│   ├── src/woo_mcp/         client, tools, server
-│   └── tests/               includes a fake WooCommerce REST API
-└── frontend/                dashboard (empty, planned)
-```
-
-`woo-mcp` is deliberately a separate project. To the gateway it is just another upstream reached over the network, and it will run as its own container.
-
-## Prerequisites
-- **Python 3.11 or newer**
-- **[uv](https://docs.astral.sh/uv/)** (manages the virtual environments)
-- For the later Kubernetes work: Docker, k3d (or kind) and Helm on a machine with enough memory (16 GB recommended)
-
-## Setup
-
+## Tests
 ```bash
-git clone <this repository>
-cd WooCommerce_MCP
-
-# install both projects' dependencies
-cd backend  && uv sync && cd ..
-cd woo-mcp  && uv sync && cd ..
+cd backend && uv run pytest              # gateway: endpoint, auth, audit, routing, failures, admin API, chat (fake LLM)
+cd woo-mcp && uv run pytest              # WooCommerce MCP server against a fake WooCommerce API
+cd upstreams/gst && uv run pytest        # GST server
+deploy/helm/tests/run.sh                 # charts: rendered for local and prod, checked without a cluster
+scripts/tests/run.sh                     # scripts, against stand-ins for kubectl/docker/k3d/helm; and a scan
+                                         # that fails if any real-looking key is in a file git would publish
 ```
+Against real systems:
+- `woo-mcp/tests/contract/`: the MCP server against a real WooCommerce (set `WOO_CONTRACT_URL`, `_KEY`, `_SECRET`).
+- `scripts/cluster-test.sh` on the cluster machine: real pods, Ingress and NetworkPolicies; it calls all three servers,
+  checks the audit log, tries internal services from a throwaway pod (they must be refused), times out a slow tool,
+  stops and deletes pods, and revokes its own test user's key.
 
-Create the gateway's settings file. It holds a secret key, so it must never be committed (`.env.*` is git-ignored):
-
+## Development without Kubernetes
 ```bash
-cd backend
-cat > .env.local <<EOF
-export GATEWAY_SECRET_KEY=$(uv run gateway-admin generate-secret-key)
-export GATEWAY_ALLOW_LOOPBACK=1
-export GATEWAY_SYNC_INTERVAL=2
-EOF
-chmod 600 .env.local
+cd backend && uv sync
+export GATEWAY_SECRET_KEY=$(uv run gateway-admin generate-secret-key) GATEWAY_ALLOW_LOOPBACK=1
+uv run gateway-admin create-user admin@example.com --role admin && uv run gateway-admin issue-key admin@example.com
+uv run gateway                                       # http://localhost:8000/mcp ; databases in the current folder
+cd ../frontend && npm ci && npm run dev              # dashboard on http://localhost:5173, forwarding /api and /mcp
 ```
+`GATEWAY_SECRET_KEY` encrypts stored server credentials: keep the same value, or stored credentials become unreadable.
+Settings are listed in `backend/src/gateway/config.py`.
 
-- `GATEWAY_SECRET_KEY` encrypts stored upstream credentials. **Every terminal and process must use the same value.** If you change it, credentials stored under the old key become unreadable and must be re-entered.
-- `GATEWAY_ALLOW_LOOPBACK=1` lets you register servers on `localhost`. This is for development only.
-- `GATEWAY_SYNC_INTERVAL=2` makes the gateway pick up CLI changes within 2 seconds (default is 5).
+---
 
-**Load these settings in every new terminal before running any `gateway` or `gateway-admin` command:**
-```bash
-cd backend
-source .env.local
-```
-A file does not set variables by itself. Each new terminal starts without them.
-
-## Run the gateway
-
-Create the first admin and an API key (the key is shown **once**):
-
-```bash
-cd backend && source .env.local
-uv run gateway-admin create-user you@example.com --role admin
-uv run gateway-admin issue-key you@example.com
-```
-
-Start the gateway (leave it running):
-
-```bash
-uv run gateway
-```
-
-It listens on port 8000. Check it:
-
-| URL | Expected |
-|---|---|
-| `http://localhost:8000/healthz` | `{"status":"ok"}` |
-| `http://localhost:8000/readyz` | `{"status":"ready"}` |
-| `http://localhost:8000/mcp` | the MCP endpoint; needs an API key, so a browser sees an error |
-| `http://localhost:8000/` | `Not found`. This is normal: the gateway has no web page |
-
-Data is stored in `gateway.db` and `gateway_jobs.db` in the directory you start it from. Always run both `gateway` and `gateway-admin` from `backend/`, or they will use different databases.
-
-## Try it: register a server and call a tool
-
-There is a small demo upstream with two tools in `backend/scripts/demo_upstream.py`.
-
-**Terminal 2: the demo upstream**
-```bash
-cd backend
-uv run python scripts/demo_upstream.py        # listens on 127.0.0.1:9001
-```
-
-**Terminal 1: register it and call it**
-```bash
-cd backend && source .env.local
-uv run gateway-admin add-server --slug demo --url http://127.0.0.1:9001/mcp
-uv run gateway-admin list-servers             # the running gateway picks it up within the sync interval
-```
-
-```bash
-KEY=wmcp_...paste-your-key... uv run python - <<'EOF'
-import asyncio, os
-from fastmcp import Client
-
-async def main():
-    async with Client("http://localhost:8000/mcp", auth=os.environ["KEY"]) as c:
-        print([t.name for t in await c.list_tools()])
-        print((await c.call_tool("demo__greet", {"name": "Ada"})).data)
-        print((await c.call_tool("demo__add", {"a": 2, "b": 3})).data)
-
-asyncio.run(main())
-EOF
-```
-
-Expected output:
-```
-['demo__add', 'demo__greet']
-Hello, Ada!
-5
-```
-
-Then see the control features:
-```bash
-uv run gateway-admin audit                         # every call: user, tool, time, outcome
-uv run gateway-admin disable-server demo           # its tools disappear within the sync interval
-uv run gateway-admin enable-server demo            # and come back
-uv run gateway-admin create-user bob@example.com
-uv run gateway-admin issue-key bob@example.com
-uv run gateway-admin list-keys bob@example.com     # shows the key id
-uv run gateway-admin revoke-key KEY_ID             # Bob's very next call is rejected
-```
-
-## Run the WooCommerce MCP server
-
-It talks to a WooCommerce store through the REST API (`/wp-json/wc/v3`) using a consumer key and secret. REST is WooCommerce's supported, versioned interface, needs no access to the database or the container, and its keys are scoped and revocable.
-
-**Tools:** `list_products`, `get_product`, `create_product`, `delete_product` (internal, hidden from clients), `list_orders`, `get_order`, `update_order_status`. Order results omit customer contact details. "Today" means the store's local day (default `Asia/Kolkata`).
-
-```bash
-cd woo-mcp
-export WOO_BASE_URL=http://your-store.example        # no /wp-json
-export WOO_CONSUMER_KEY=ck_...
-export WOO_CONSUMER_SECRET=cs_...
-export MCP_SERVER_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-uv run python -m woo_mcp                              # listens on port 8000
-```
-
-Register it in the gateway. The token is passed through the environment and never appears as a command argument:
-
-```bash
-cd backend && source .env.local
-export MCP_SERVER_TOKEN=...same value as above...
-uv run gateway-admin add-server --slug woo --url http://localhost:8000/mcp \
-    --credential-type bearer --credential-env MCP_SERVER_TOKEN
-```
-
-(If the gateway also runs on port 8000, give one of them a different port with `GATEWAY_PORT` or `MCP_PORT`.)
-
-The server also exposes `/healthz` and `/readyz` without a token.
-
-## Connect an MCP client
-
-Any client that supports Streamable HTTP can use the gateway with only a URL and a key.
-
-- **URL:** `http://localhost:8000/mcp`
-- **Header:** `Authorization: Bearer <your API key>`
-
-For example, with MCP Inspector (needs Node):
-```bash
-npx @modelcontextprotocol/inspector
-```
-Choose Streamable HTTP, enter the URL, and add the header.
-
-## Admin command reference
-
-Run as `uv run gateway-admin <command>` from `backend/` with `.env.local` loaded.
-
-| Area | Commands |
-|---|---|
-| Setup | `generate-secret-key` |
-| Users | `create-user EMAIL [--role admin\|member]`, `list-users`, `deactivate-user EMAIL`, `activate-user EMAIL` |
-| Keys | `issue-key EMAIL`, `list-keys EMAIL`, `revoke-key KEY_ID` |
-| Servers | `add-server --slug SLUG --url URL [--credential-type none\|bearer\|header] [--credential-env VAR \| --credential-stdin]`, `list-servers`, `enable-server SLUG`, `disable-server SLUG`, `remove-server SLUG`, `set-credential SLUG` |
-| Audit | `audit [--user EMAIL] [--server SLUG] [--outcome OUTCOME] [--limit N]` |
-
-Use `--help` on any command for details. Credentials are accepted only through an environment variable, stdin or a hidden prompt, never as an argument. Errors print as `error: ...` with exit code 1.
-
-## Configuration
-
-All settings come from environment variables, so the same build runs unchanged in Kubernetes with values from Secrets and ConfigMaps.
-
-**Gateway**
-
-| Variable | Default | Purpose |
+## Beyond the core
+Not built yet: provisioning more stores from the dashboard (each store is already a separate chart install in its
+own namespace).
+| Item | What exists | Where |
 |---|---|---|
-| `GATEWAY_SECRET_KEY` | *(required)* | Encrypts stored upstream credentials |
-| `GATEWAY_DB_URL` | `sqlite:///gateway.db` | Registry, users, keys, audit log |
-| `GATEWAY_JOBS_DB_URL` | `sqlite:///gateway_jobs.db` | Undo jobs (a separate file on purpose) |
-| `GATEWAY_ADMIN_EMAIL` | none | Create this admin at startup; prints a key once if it has none |
-| `GATEWAY_ALLOW_LOOPBACK` | off | Allow upstream URLs on localhost (development only) |
-| `GATEWAY_HOST` / `GATEWAY_PORT` | `0.0.0.0` / `8000` | Listen address |
-| `GATEWAY_INCIDENT_LOG` | none | JSON-lines file for operator alerts that survives an audit-database outage |
-| `GATEWAY_WORKER_INTERVAL` | `2` | Seconds between undo-worker passes |
-| `GATEWAY_SYNC_INTERVAL` | `5` | Seconds between syncing live servers with the registry |
-| `GATEWAY_WOO_SLUG` | `woo` | Slug of the WooCommerce server, so its undo rules apply |
-
-**WooCommerce MCP server**
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `WOO_BASE_URL` | *(required)* | Store address, without `/wp-json` |
-| `WOO_CONSUMER_KEY` / `WOO_CONSUMER_SECRET` | *(required)* | WooCommerce REST API credentials |
-| `MCP_SERVER_TOKEN` | *(required)* | Bearer token the gateway must present |
-| `STORE_TIMEZONE` | `Asia/Kolkata` | IANA zone used for "today" and for displayed times |
-| `WOO_TIMEOUT` | `10` | Seconds per store request |
-| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | Listen address |
-
-## Run the tests
-
-```bash
-cd backend && uv run pytest        # gateway, including end-to-end tests through the real MCP server
-cd woo-mcp && uv run pytest        # WooCommerce MCP server, against a fake WooCommerce API
-```
-
-The backend end-to-end tests start the gateway, the WooCommerce MCP server and a fake store as separate servers on real local ports. They cover the full flow: two users, tool listing, calls, revocation, disabled and dead upstreams, and automatic reversal when the audit write fails.
-
-## Design notes
-
-- **Tool-name scheme:** `<slug>__<tool>`, split on the first `__`. Slugs allow only lowercase letters, digits and single hyphens, so the split is never ambiguous.
-- **Live tool listing:** every listing asks each enabled server, so a disabled or dead server disappears immediately. There is no cache. A cache can be added if listing becomes slow.
-- **Stateless MCP sessions:** each request carries its key and is checked against the database, so revocation applies inside an open session and several gateway replicas could serve the same key.
-- **The registry is the source of truth:** a background sync applies server changes made by the CLI or another process to the running gateway.
-- **Audit with write-ahead:** a `started` row is written before each call; if that fails, the call is refused. If the final write fails after a state-changing call, the gateway queues a reversal instead of leaving an unrecorded action.
-- **Reversal rules:** an undo runs in the background with retries and backoff, under the same per-resource lock as normal calls, and only if the resource still matches the state our action left (otherwise it ends as a conflict for an admin). While an undo is pending, other changes to the same resource are refused. Undo tools must be idempotent.
-- **Internal tools:** `delete_product` exists only so a product creation can be undone. It is hidden from every client and refused if called; attempts are audited.
-- **Audit stores metadata only:** who, which server and tool, when, how long and the outcome. Arguments and results are not stored because they can contain customer data.
-
-## Security model
-
-- API keys have the form `wmcp_<id>_<secret>`. Only a SHA-256 hash is stored, comparison is constant-time, and the secret is shown once.
-- Revoking a key or deactivating a user takes effect on the very next request.
-- Upstream credentials are encrypted at rest (Fernet) and are never returned by any API, printed by the CLI or sent to clients.
-- A client's key is never forwarded to an upstream. The gateway presents its own stored credential.
-- Upstream URLs are checked when saved: only `http` and `https`; the cloud-metadata range and link-local addresses are always blocked; loopback is blocked unless explicitly allowed; private cluster addresses are allowed.
-- Error messages to clients are fixed strings without upstream URLs or raw exception text.
-- Tool descriptions and results from upstreams are untrusted data and are passed through unchanged. An upstream could try to steer a model through them.
-
-## Troubleshooting
-
-| Symptom | Cause and fix |
-|---|---|
-| `GATEWAY_SECRET_KEY is not set` | The terminal has not loaded the settings. Run `source .env.local` from `backend/`. |
-| `Not found` at `http://localhost:8000/` | Normal. Use `/healthz` or an MCP client on `/mcp`. |
-| `address already in use` | Another gateway is on that port. Stop it, or set `GATEWAY_PORT`. |
-| `error: a user with email ... already exists` | The user was created before. Run only `issue-key`. |
-| `parse error near '\n'` in zsh | Do not type the angle brackets in `<placeholder>` examples. |
-| Server shows `unreachable` | `list-servers` and the audit log show the reason. Check the URL and credential. |
-| Tools list is empty | No server is registered or enabled, or the sync interval has not elapsed yet. |
-| Stored credentials cannot be decrypted | `GATEWAY_SECRET_KEY` differs from the one used when they were saved. |
+| Security hardening | SSRF checks on server URLs (metadata and link-local blocked); NetworkPolicies deny by default in both namespaces; non-root containers, read-only root filesystems; upstream credentials encrypted at rest (Fernet). No component uses the Kubernetes API, so no RBAC is needed. | `backend/src/gateway/registry/`, `deploy/helm/*/templates/networkpolicy.yaml` |
+| Observability (partial) | Clear reasons for unreachable servers and failed calls, in the dashboard and the audit log; no metrics. | `Status_Codes.md`, Servers and Audit log pages |
+| Upgrades and rollback | `helm upgrade`, automatic rollback of failed upgrades, `helm rollback`; setup Job re-run per revision. | `scripts/deploy-local.sh`, [design](docs/design.md#upgrade-and-rollback) |
+| Undo layer | Automatic undo of a successful action whose audit record failed (durable job queue with retries). | `backend/src/gateway/compensation.py`, `undo_worker.py` |

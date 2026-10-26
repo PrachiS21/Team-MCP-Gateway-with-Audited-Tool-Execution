@@ -31,7 +31,7 @@ class Run:
         out, err = io.StringIO(), io.StringIO()
         stdin_io = _Tty(stdin) if tty else io.StringIO(stdin)
         code = main(list(argv), settings=self.settings, out=out, err=err, stdin=stdin_io, env=env or {},
-                    prompt=prompt or (lambda _: ""))
+                    prompt=prompt or (lambda _: ""), actor="cli:tester")
         return code, out.getvalue(), err.getvalue()
 
 
@@ -222,3 +222,55 @@ async def test_cli_changes_a_running_gateway(cli, settings):
 
 async def _is(awaitable, expected):
     return await awaitable == expected
+
+
+# -- every admin action is recorded as an event ---------------------------------------------------------------
+
+def test_every_admin_action_is_recorded_as_an_event_and_no_secret_is_in_any_of_them(cli, settings):
+    import sqlite3
+    from gateway.audit.service import AuditLog
+    cli("create-user", "a@example.com", "--role", "admin")
+    _, out, _ = cli("issue-key", "a@example.com", "--name", "laptop")
+    key = re.search(r"wmcp_[0-9a-f]{8}_[0-9a-f]{64}", out).group(0)
+    cli("add-server", "--slug", "shop", "--url", "http://user:pw123@10.0.0.5:8000/mcp?tok=q1", "--credential-type", "bearer",
+        "--credential-env", "T", env={"T": SECRET})
+    cli("set-credential", "shop", "--credential-env", "T", env={"T": "ROTATED-" + SECRET})
+    cli("disable-server", "shop"); cli("enable-server", "shop")
+    cli("revoke-key", key.split("_")[1])
+    cli("deactivate-user", "a@example.com"); cli("activate-user", "a@example.com")
+    cli("remove-server", "shop")
+
+    events = AuditLog(settings.db_url).events(limit=100)
+    assert [e.action for e in reversed(events)] == [
+        "user_created", "key_issued", "server_created", "server_updated", "server_disabled", "server_enabled",
+        "key_revoked", "user_deactivated", "user_activated", "server_removed"]
+    assert {e.actor for e in events} == {"cli:tester"}
+    by = {e.action: e for e in events}
+    assert by["key_issued"].details == {"email": "a@example.com", "key_id": key.split("_")[1], "name": "laptop"}
+    assert by["key_revoked"].details == {"key_id": key.split("_")[1], "email": "a@example.com"}
+    assert by["server_updated"].details == {"changed": ["credential"]} and by["server_updated"].server_slug == "shop"
+    assert by["server_created"].details["url"] == "http://10.0.0.5:8000/mcp"  # no password, no query string
+
+    dump = " ".join(str(r) for r in sqlite3.connect(settings.db_url.removeprefix("sqlite:///")).execute("select * from admin_events"))
+    shown = cli("events")[1]
+    for secret in (key, SECRET, "ROTATED-" + SECRET, "pw123", "tok=q1"):
+        assert secret not in dump and secret not in shown, secret
+    for word in ("cli:tester", "key_issued", "server_removed", "a@example.com"):
+        assert word in shown
+
+
+def test_failed_commands_leave_no_event(cli, settings):
+    from gateway.audit.service import AuditLog
+    cli("create-user", "a@example.com")
+    assert cli("create-user", "a@example.com")[0] == 1  # already exists
+    assert cli("revoke-key", "deadbeef")[0] == 1
+    assert cli("disable-server", "nope")[0] == 1
+    assert cli("add-server", "--slug", "meta", "--url", "http://169.254.169.254/x")[0] == 1
+    assert [e.action for e in AuditLog(settings.db_url).events()] == ["user_created"]  # only the one that worked
+
+
+def test_a_broken_audit_store_does_not_fail_a_command_that_succeeded(cli, monkeypatch):
+    from gateway.audit.service import AuditLog
+    monkeypatch.setattr(AuditLog, "record_event", lambda self, **kw: (_ for _ in ()).throw(RuntimeError("audit db down")))
+    code, out, err = cli("create-user", "a@example.com")
+    assert code == 0 and "created" in out and "could not be recorded" in err

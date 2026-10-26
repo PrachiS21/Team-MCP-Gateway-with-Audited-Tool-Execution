@@ -1,0 +1,11 @@
+Store "{{ .Values.storeName }}" installed in namespace {{ .Release.Namespace }}.
+
+  Storefront : {{ include "store.publicUrl" . }}
+  Admin      : {{ include "store.publicUrl" . }}/wp-admin   (user: {{ .Values.site.adminUser }}; password is in Secret {{ .Values.secrets.wordpress }})
+
+The first start downloads WooCommerce; follow the setup with:
+  kubectl -n {{ .Release.Namespace }} logs -f job/store-setup-r{{ .Release.Revision }}
+The MCP server turns Ready only after that Job has registered its API key.
+
+The MCP server is internal only: service woo-mcp.{{ .Release.Namespace }}.svc.cluster.local:8000, reachable from
+pods labelled {{ range $k, $v := .Values.networkPolicy.gateway.podLabels }}{{ $k }}={{ $v }}{{ end }} in namespace {{ .Values.networkPolicy.gateway.namespace }}.

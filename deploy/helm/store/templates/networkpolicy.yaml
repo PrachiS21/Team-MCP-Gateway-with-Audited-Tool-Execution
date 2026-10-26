@@ -1,0 +1,136 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default deny, then one small rule per connection that is allowed. Allowed connections:
+#   Traefik -> WordPress:80            (visitors)
+#   woo-mcp -> WordPress:80            (the MCP server calls the REST API)
+#   gateway (namespace platform) -> woo-mcp:8000
+#   WordPress and the setup Job -> MariaDB:3306
+#   the setup Job -> the internet on 80/443 (it downloads WordPress plugins)
+#   every pod -> cluster DNS
+# Everything else is dropped, including a pod in any other namespace talking to MariaDB or to woo-mcp.
+# Side effect: WordPress itself cannot reach the internet, so its update checks and wp-cron loopback time out.
+{{- $np := .Values.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ $np.dns.namespace }} }
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.dns.podLabels | nindent 14 }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: wordpress }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ $np.ingressController.namespace }} }
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.ingressController.podLabels | nindent 14 }}
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: woo-mcp }
+      ports:
+        - { protocol: TCP, port: 80 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: mariadb }
+      ports:
+        - { protocol: TCP, port: 3306 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mariadb
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: mariadb }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: wordpress }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: store-setup }
+      ports:
+        - { protocol: TCP, port: 3306 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: woo-mcp
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: woo-mcp }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ $np.gateway.namespace }} }
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.gateway.podLabels | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8000 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: wordpress }
+      ports:
+        - { protocol: TCP, port: 80 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: store-setup
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: store-setup }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: mariadb }
+      ports:
+        - { protocol: TCP, port: 3306 }
+    - to:
+        - ipBlock: { cidr: 0.0.0.0/0 }
+      ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 80 }
+{{- end }}

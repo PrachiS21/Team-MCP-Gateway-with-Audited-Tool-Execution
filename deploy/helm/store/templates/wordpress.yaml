@@ -1,0 +1,109 @@
+# WordPress + WooCommerce (the web server). The files live on a PVC shared with the setup Job.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wordpress-data
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: wordpress
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- include "store.storageClass" . | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.wordpressSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: wordpress
+spec:
+  selector:
+    app.kubernetes.io/name: wordpress
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: wordpress
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # the volume can be attached once; a rolling update would start the new pod while the old holds it
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wordpress
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" . | nindent 8 }}
+        app.kubernetes.io/name: wordpress
+      annotations:
+        # A ConfigMap mounted with subPath is not refreshed in a running pod, so a changed file must restart it.
+        checksum/apache-conf: {{ .Files.Get "files/hide-auth-user.conf" | sha256sum }}
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      containers:
+        - name: wordpress
+          image: {{ include "store.image" .Values.images.wordpress }}
+          imagePullPolicy: {{ .Values.images.wordpress.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 80 }
+          env:
+            {{- include "store.dbEnv" . | nindent 12 }}
+            # Written into wp-config.php. Same block as the Compose check: the site address is fixed, and an
+            # "X-Forwarded-Proto: https" header (sent by our MCP server) makes WordPress treat the request as HTTPS,
+            # which WooCommerce requires before it accepts consumer-key authentication.
+            - name: WORDPRESS_CONFIG_EXTRA
+              value: |
+                define('WP_HOME', '{{ include "store.publicUrl" . }}');
+                define('WP_SITEURL', '{{ include "store.publicUrl" . }}');
+                if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                    $_SERVER['HTTPS'] = 'on';
+                }
+          volumeMounts:
+            - { name: html, mountPath: /var/www/html }
+            # Apache's access log would otherwise record the Basic-auth user name, which for WooCommerce is the consumer
+            # key (ck_...), on every call from woo-mcp. This file redefines the log formats without it (see the file).
+            - { name: apache-conf, mountPath: /etc/apache2/conf-enabled/zz-hide-auth-user.conf, subPath: hide-auth-user.conf, readOnly: true }
+          # /wp-login.php runs PHP and reads the database, so "ready" means the whole page path works.
+          # Liveness only checks the port: if the database is down, restarting WordPress would not help.
+          startupProbe:
+            httpGet: { path: /wp-login.php, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 5          # the default (1 s) is too short for PHP on a cold start: seen on the HP
+            failureThreshold: 60       # up to 5 minutes: the first start copies WordPress into the volume
+          readinessProbe:
+            httpGet: { path: /wp-login.php, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources.wordpress | nindent 12 }}
+      volumes:
+        - name: html
+          persistentVolumeClaim: { claimName: wordpress-data }
+        - name: apache-conf
+          configMap: { name: wordpress-apache-conf }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wordpress-apache-conf
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: wordpress
+data:
+  hide-auth-user.conf: |
+{{ .Files.Get "files/hide-auth-user.conf" | indent 4 }}

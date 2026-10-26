@@ -1,4 +1,4 @@
-"""The gateway's MCP endpoint.
+"""The gateway's MCP endpoint (and, from api.py, the dashboard's /api routes).
 
   client --Bearer <api key>--> GatewayKeyVerifier --> GatewayMiddleware --> GatewayService
                                 (who is this?)        (list / call)         (audit, route, undo)
@@ -11,8 +11,10 @@ registry and are used only by UpstreamClient.
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Mapping
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
@@ -22,6 +24,8 @@ from fastmcp.tools import Tool, ToolResult
 from mcp.types import TextContent
 from starlette.responses import JSONResponse
 
+from gateway.api import register_api
+from gateway.chat import LLM, ChatAgent, OpenAICompatibleLLM
 from gateway.audit.service import AuditLog
 from gateway.auth.keys import parse_key
 from gateway.auth.service import AuthService
@@ -33,6 +37,7 @@ from gateway.locks import KeyedLocks
 from gateway.mcp.manager import UpstreamManager
 from gateway.registry.crypto import SecretBox
 from gateway.registry.registry import ServerRegistry
+from gateway.seed import apply_seed
 from gateway.service import Caller, GatewayResult, GatewayService
 from gateway.woo_compensation import register_woo_compensations
 from gateway.undo_worker import UndoWorker
@@ -112,12 +117,15 @@ class Gateway:
     service: GatewayService
     worker: UndoWorker
     mcp: FastMCP
+    api_routes: list  # (method, path, access) of every /api route
 
     def http_app(self):
         return self.mcp.http_app(path="/mcp", stateless_http=True)
 
 
-def create_gateway(settings: Settings, compensations: CompensationRegistry | None = None) -> Gateway:
+def create_gateway(settings: Settings, compensations: CompensationRegistry | None = None,
+                   env: Mapping[str, str] | None = None, llm: LLM | None = None) -> Gateway:
+    """`llm` replaces the configured LLM (tests pass a scripted fake)."""
     box = SecretBox(settings.secret_key)
     registry = ServerRegistry(settings.db_url, box, allow_loopback=settings.allow_loopback)
     auth = AuthService(settings.db_url)
@@ -128,6 +136,17 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
     if compensations is None:
         compensations = CompensationRegistry()
         register_woo_compensations(compensations, settings.woo_slug)
+
+    started = {"seed_file": settings.seed_file is not None}
+    if settings.seed_file is not None:  # raises SeedError on a bad file: the gateway then refuses to start
+        report = apply_seed(settings.seed_file, os.environ if env is None else env, registry, audit, incidents)
+        started.update(created=[c.slug for c in report.changes if c.action == "created"],
+                       updated=[c.slug for c in report.changes if c.action == "updated"],
+                       unchanged=report.unchanged)
+    try:  # every start and restart is audited, whether or not anything changed
+        audit.record_event(actor="system", action="gateway_started", details=started)
+    except Exception:  # noqa: BLE001 - a broken audit store must not keep the gateway from starting
+        log.exception("could not record the gateway_started event")
 
     manager = UpstreamManager()
     registry.load_into(manager)
@@ -172,4 +191,13 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
             return JSONResponse({"status": "database unavailable"}, status_code=503)
         return JSONResponse({"status": "ready"})
 
-    return Gateway(settings, manager, registry, auth, audit, service, worker, mcp)
+    if llm is None and settings.llm_model and settings.llm_api_key:
+        llm = OpenAICompatibleLLM(settings.llm_base_url, settings.llm_model, settings.llm_api_key, settings.llm_timeout)
+    chat = ChatAgent(service, llm) if llm is not None else None  # None: /api/chat answers 503 "not configured"
+    if chat is None:
+        log.info("chat agent off: set GATEWAY_LLM_MODEL and GATEWAY_LLM_API_KEY to turn it on")
+
+    api_routes = register_api(mcp, auth=auth, registry=registry, audit=audit, manager=manager, service=service,
+                              cookie_secure=settings.cookie_secure, chat=chat)
+
+    return Gateway(settings, manager, registry, auth, audit, service, worker, mcp, api_routes)

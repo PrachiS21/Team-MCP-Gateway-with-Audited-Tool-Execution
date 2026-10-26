@@ -2,7 +2,7 @@
 cluster). Nothing secret has a default."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -18,7 +18,14 @@ class Settings:
     incident_log: Path | None = None  # GATEWAY_INCIDENT_LOG: JSONL file that survives an audit DB outage
     worker_interval: float = 2.0  # GATEWAY_WORKER_INTERVAL: seconds between undo-worker passes
     sync_interval: float = 5.0  # GATEWAY_SYNC_INTERVAL: seconds between registry -> live-server syncs
+    seed_file: Path | None = None  # GATEWAY_SEED_FILE: JSON listing servers to register/sync at startup (see seed.py)
     woo_slug: str = "woo"  # GATEWAY_WOO_SLUG: slug of the registered WooCommerce MCP server (its undo rules apply)
+    cookie_secure: bool = False  # GATEWAY_COOKIE_SECURE=1 in production (HTTPS): the browser then sends the cookie over HTTPS only
+    # The chat agent (chat.py) is on only when a model and a key are set. Any OpenAI-compatible endpoint works.
+    llm_base_url: str = "https://api.groq.com/openai/v1"  # GATEWAY_LLM_BASE_URL
+    llm_model: str | None = None  # GATEWAY_LLM_MODEL, e.g. a tool-calling model your provider offers
+    llm_api_key: str | None = field(default=None, repr=False)  # GATEWAY_LLM_API_KEY: from a Kubernetes Secret
+    llm_timeout: float = 60.0  # GATEWAY_LLM_TIMEOUT: seconds per LLM request
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -38,5 +45,11 @@ class Settings:
             incident_log=Path(env["GATEWAY_INCIDENT_LOG"]) if env.get("GATEWAY_INCIDENT_LOG") else None,
             worker_interval=float(env.get("GATEWAY_WORKER_INTERVAL", cls.worker_interval)),
             sync_interval=float(env.get("GATEWAY_SYNC_INTERVAL", cls.sync_interval)),
+            seed_file=Path(env["GATEWAY_SEED_FILE"]) if env.get("GATEWAY_SEED_FILE") else None,
             woo_slug=env.get("GATEWAY_WOO_SLUG", cls.woo_slug),
+            cookie_secure=env.get("GATEWAY_COOKIE_SECURE", "") in ("1", "true", "yes"),
+            llm_base_url=env.get("GATEWAY_LLM_BASE_URL") or cls.llm_base_url,
+            llm_model=env.get("GATEWAY_LLM_MODEL") or None,
+            llm_api_key=env.get("GATEWAY_LLM_API_KEY") or None,
+            llm_timeout=float(env.get("GATEWAY_LLM_TIMEOUT", cls.llm_timeout)),
         )

@@ -19,7 +19,7 @@ from gateway.audit.service import AuditError, AuditLog
 from gateway.auth.service import AuthError, AuthService, User
 from gateway.config import Settings
 from gateway.registry.crypto import SecretBox, SecretBoxError, generate_key
-from gateway.registry.registry import RegistryError, ServerRegistry
+from gateway.registry.registry import RegistryError, ServerRegistry, safe_url
 from gateway.registry.url_policy import UrlPolicyError
 
 EXPECTED_ERRORS = (AuthError, RegistryError, UrlPolicyError, AuditError, SecretBoxError)
@@ -42,16 +42,42 @@ def _table(out: TextIO, headers: list[str], rows: list[list[str]]) -> None:
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(line)).rstrip(), file=out)
 
 
+def _default_actor() -> str:
+    try:
+        return f"cli:{getpass.getuser()}"
+    except Exception:  # noqa: BLE001 - no usable user name (e.g. a bare container)
+        return "cli:unknown"
+
+
+def _detail(details: dict) -> str:
+    """A short, safe summary of an event's details for the events table."""
+    if details.get("changed"):
+        return ", ".join(details["changed"])
+    skip = {"email", "changed"}
+    parts = [f"{k}={v}" for k, v in details.items() if k not in skip and not isinstance(v, (dict, list))]
+    return ", ".join(parts) or "-"
+
+
 class Cli:
     def __init__(self, settings: Settings, out: TextIO, stdin: TextIO, env: dict[str, str],
-                 prompt: Callable[[str], str] = getpass.getpass):
+                 prompt: Callable[[str], str] = getpass.getpass, actor: str | None = None, err: TextIO | None = None):
         self.settings, self.out, self.stdin, self.env, self.prompt = settings, out, stdin, env, prompt
+        self.err = err or sys.stderr
+        self.actor = actor or _default_actor()
         self.auth = AuthService(settings.db_url)
         self.audit = AuditLog(settings.db_url)
         self.registry = ServerRegistry(settings.db_url, SecretBox(settings.secret_key),
                                        allow_loopback=settings.allow_loopback)
 
     # -- helpers ----------------------------------------------------------
+
+    def _event(self, action: str, server_slug: str | None = None, **details) -> None:
+        """Record an admin action. Never pass a secret here: only names, ids and safe values.
+        The action has already succeeded, so a failure to record it is reported, not fatal."""
+        try:
+            self.audit.record_event(actor=self.actor, action=action, server_slug=server_slug, details=details)
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: the action succeeded but could not be recorded in the audit log: {exc}", file=self.err)
 
     def _user(self, email: str) -> User:
         user = self.auth.get_user_by_email(email)
@@ -77,6 +103,7 @@ class Cli:
     def create_user(self, a) -> None:
         u = self.auth.create_user(a.email, a.role)
         print(f"created {u.role} {u.email}", file=self.out)
+        self._event("user_created", email=u.email, role=u.role)
 
     def list_users(self, a) -> None:
         _table(self.out, ["EMAIL", "ROLE", "ACTIVE", "CREATED"],
@@ -85,15 +112,18 @@ class Cli:
     def deactivate_user(self, a) -> None:
         self.auth.set_active(self._user(a.email).id, False)
         print(f"deactivated {a.email}: all of their keys stopped working", file=self.out)
+        self._event("user_deactivated", email=a.email)
 
     def activate_user(self, a) -> None:
         self.auth.set_active(self._user(a.email).id, True)
         print(f"activated {a.email}", file=self.out)
+        self._event("user_activated", email=a.email)
 
     # -- keys -------------------------------------------------------------
 
     def issue_key(self, a) -> None:
         issued = self.auth.issue_key(self._user(a.email).id, a.name)
+        self._event("key_issued", email=a.email, key_id=issued.key_id, name=a.name)
         if a.quiet:
             print(issued.key, file=self.out)
         else:
@@ -107,8 +137,9 @@ class Cli:
                  f"revoked {_fmt_time(k.revoked_at)}" if k.revoked else "active"] for k in keys])
 
     def revoke_key(self, a) -> None:
-        self.auth.revoke_key(a.key_id)
+        info = self.auth.revoke_key(a.key_id)
         print(f"revoked key {a.key_id}: its next request is rejected", file=self.out)
+        self._event("key_revoked", key_id=a.key_id, email=self.auth.get_user(info.user_id).email)
 
     # -- servers ----------------------------------------------------------
 
@@ -122,6 +153,7 @@ class Cli:
                                  enabled=not a.disabled, timeout=a.timeout)
         print(f"added server {v.slug} ({v.url}); a running gateway picks it up within "
               f"{self.settings.sync_interval:g}s", file=self.out)
+        self._event("server_created", v.slug, url=safe_url(v.url), credential_type=v.credential_type, enabled=v.enabled)
 
     def list_servers(self, a) -> None:
         _table(self.out, ["SLUG", "NAME", "URL", "ENABLED", "CREDENTIAL"],
@@ -132,14 +164,17 @@ class Cli:
     def enable_server(self, a) -> None:
         self.registry.set_enabled(self.registry.get_by_slug(a.slug).id, True)
         print(f"enabled {a.slug}", file=self.out)
+        self._event("server_enabled", a.slug)
 
     def disable_server(self, a) -> None:
         self.registry.set_enabled(self.registry.get_by_slug(a.slug).id, False)
         print(f"disabled {a.slug}: its tools disappear within {self.settings.sync_interval:g}s", file=self.out)
+        self._event("server_disabled", a.slug)
 
     def remove_server(self, a) -> None:
         self.registry.delete(self.registry.get_by_slug(a.slug).id)
         print(f"removed {a.slug}", file=self.out)
+        self._event("server_removed", a.slug)
 
     def set_credential(self, a) -> None:
         view = self.registry.get_by_slug(a.slug)
@@ -149,6 +184,15 @@ class Cli:
         ctype = view.credential_type if view.credential_type != "none" else "bearer"
         self.registry.update(view.id, credential_type=ctype, credential=credential)
         print(f"credential for {a.slug} replaced", file=self.out)
+        self._event("server_updated", a.slug, changed=["credential"])  # that it changed, never the value
+
+    # -- configuration changes ----------------------------------------------
+
+    def events(self, a) -> None:
+        rows = self.audit.events(server_slug=a.server, limit=a.limit)
+        _table(self.out, ["TIME", "ACTOR", "ACTION", "TARGET", "DETAIL"],
+               [[_fmt_time(e.ts), e.actor, e.action, e.server_slug or e.details.get("email") or e.details.get("key_id") or "-",
+                 _detail(e.details)] for e in rows])
 
     # -- audit ------------------------------------------------------------
 
@@ -194,6 +238,9 @@ def build_parser() -> argparse.ArgumentParser:
     c = cmd("set-credential", "replace a server's credential"); c.add_argument("slug")
     c.add_argument("--credential-env", metavar="VAR"); c.add_argument("--credential-stdin", action="store_true")
 
+    c = cmd("events", "show configuration changes (e.g. servers synced from the seed file), newest first")
+    c.add_argument("--server", metavar="SLUG"); c.add_argument("--limit", type=int, default=20)
+
     c = cmd("audit", "show the audit log, newest first")
     c.add_argument("--user", metavar="EMAIL"); c.add_argument("--server", metavar="SLUG")
     c.add_argument("--outcome"); c.add_argument("--limit", type=int, default=20)
@@ -202,14 +249,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None, *, settings: Settings | None = None, out: TextIO | None = None,
          err: TextIO | None = None, stdin: TextIO | None = None, env: dict[str, str] | None = None,
-         prompt: Callable[[str], str] = getpass.getpass) -> int:
+         prompt: Callable[[str], str] = getpass.getpass, actor: str | None = None) -> int:
     out, err, stdin, env = out or sys.stdout, err or sys.stderr, stdin or sys.stdin, env if env is not None else dict(os.environ)
     args = build_parser().parse_args(argv)
     if args.command == "generate-secret-key":
         print(generate_key(), file=out)
         return 0
     try:
-        cli = Cli(settings or Settings.from_env(), out, stdin, env, prompt)
+        cli = Cli(settings or Settings.from_env(), out, stdin, env, prompt, actor, err)
         getattr(cli, args.command.replace("-", "_") if args.command != "audit" else "audit_log")(args)
     except (CliError, *EXPECTED_ERRORS) as exc:
         print(f"error: {exc}", file=err)

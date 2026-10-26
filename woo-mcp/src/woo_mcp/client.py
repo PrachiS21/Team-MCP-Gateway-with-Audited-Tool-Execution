@@ -17,6 +17,8 @@ API_PREFIX = "/wp-json/wc/v3"
 MAX_PER_PAGE = 50
 _RETRYABLE_STATUS = {502, 503, 504}
 _TAGS = re.compile(r"<[^>]+>")
+# The real store answers an unknown id with "ID is invalid." (HTTP 400) on some routes and "Invalid ID." (404) on others.
+_UNKNOWN_ID = re.compile(r"(?i)^\s*(invalid id|id is invalid)\.?\s*$")
 
 
 class WooError(Exception):
@@ -81,7 +83,10 @@ class WooClient:
         if code == 404:
             raise WooError("not_found", f"{what} not found.")
         if 400 <= code < 500:
-            raise WooError("invalid", _clean(_store_message(resp)) or "The store rejected the request.")
+            message = _clean(_store_message(resp))
+            if _UNKNOWN_ID.match(message):
+                raise WooError("not_found", f"{what} not found.")
+            raise WooError("invalid", message or "The store rejected the request.")
         raise WooError("unavailable", "The store is unavailable or returned an error.")
 
     # -- products ---------------------------------------------------------

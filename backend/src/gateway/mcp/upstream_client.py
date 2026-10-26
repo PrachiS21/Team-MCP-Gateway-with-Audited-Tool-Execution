@@ -66,6 +66,7 @@ class UpstreamConfig:
 
 _CONNECT_ERROR_NAMES = {"ConnectError", "ConnectTimeout", "ConnectionRefusedError", "RemoteProtocolError", "ReadError"}
 _CONNECTION_CLOSED = -32000  # JSON-RPC code the MCP SDK uses for "Connection closed"
+_REQUEST_TIMEOUT = -32001  # ... and for "Request timed out" (its own per-request timeout, on a reused session)
 
 
 def _classify(exc: BaseException) -> UpstreamError:
@@ -78,6 +79,9 @@ def _classify(exc: BaseException) -> UpstreamError:
         if id(e) in seen:  # cause/context chains can be cyclic
             continue
         seen.add(id(e))
+        # Timeouts first: TimeoutError is a subclass of OSError, so the connection check below would also match it.
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)) or getattr(e, "code", None) == _REQUEST_TIMEOUT:
+            return UpstreamError(ErrorKind.TIMEOUT, "upstream did not answer in time")
         if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
             return UpstreamError(ErrorKind.AUTH, f"upstream rejected the credential (HTTP {e.response.status_code})")
         # FastMCP bundles its own "httpx2", so match connection errors by class name as well.

@@ -6,13 +6,17 @@ import sys
 import uvicorn
 
 from gateway.config import Settings
+from gateway.seed import SeedError
 from gateway.server import create_gateway
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = Settings.from_env()
-    gw = create_gateway(settings)
+    try:
+        gw = create_gateway(settings)
+    except SeedError as exc:
+        raise SystemExit(f"refusing to start: {exc}") from None
 
     if settings.admin_email:
         admin, issued = gw.auth.ensure_admin(settings.admin_email)

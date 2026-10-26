@@ -1,0 +1,81 @@
+# One-off store setup: the SAME script as the Compose check (files/setup-store.sh), mounted from a ConfigMap.
+# It installs WordPress + WooCommerce, applies the store settings and registers the REST API key that the MCP server uses.
+#
+# Why a Job and not an init container: the WordPress files and wp-config.php are written by the wordpress
+# container when IT starts, so an init container (which runs first) would wait for them forever. The Job waits for
+# wp-config.php instead, exactly as the Compose setup container does.
+#
+# The name carries the release revision: a Job's pod template cannot be changed in place, so every
+# `helm upgrade` or `helm rollback` creates a fresh Job. The script is safe to repeat.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: store-setup-scripts
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+data:
+  setup-store.sh: |
+{{ .Files.Get "files/setup-store.sh" | indent 4 }}
+  create-api-key.php: |
+{{ .Files.Get "files/create-api-key.php" | indent 4 }}
+  keep-url-scheme.php: |
+{{ .Files.Get "files/keep-url-scheme.php" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: store-setup-r{{ .Release.Revision }}
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: store-setup
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" . | nindent 8 }}
+        app.kubernetes.io/name: store-setup
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      restartPolicy: OnFailure
+      # The volume can be attached to one node only: run on the node where WordPress runs.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: wordpress
+      securityContext:
+        runAsUser: 33          # www-data, the owner of the WordPress files
+        runAsGroup: 33
+      containers:
+        - name: setup
+          image: {{ include "store.image" .Values.images.wpcli }}
+          imagePullPolicy: {{ .Values.images.wpcli.pullPolicy }}
+          command: [sh, /setup/setup-store.sh]
+          env:
+            {{- include "store.dbEnv" . | nindent 12 }}
+            - { name: WP_URL, value: {{ include "store.publicUrl" . | quote }} }
+            - { name: WP_TITLE, value: {{ .Values.site.title | quote }} }
+            - { name: WP_ADMIN_USER, value: {{ .Values.site.adminUser | quote }} }
+            - { name: WP_ADMIN_EMAIL, value: {{ .Values.site.adminEmail | quote }} }
+            - { name: WP_TIMEZONE, value: {{ .Values.timezone | quote }} }
+            - { name: WC_VERSION, value: {{ .Values.woocommerceVersion | quote }} }
+            - name: WP_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.wordpress }}, key: WP_ADMIN_PASSWORD } }
+            - name: WC_CONSUMER_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.wordpress }}, key: WC_CONSUMER_KEY } }
+            - name: WC_CONSUMER_SECRET
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.wordpress }}, key: WC_CONSUMER_SECRET } }
+          volumeMounts:
+            - { name: html, mountPath: /var/www/html }
+            - { name: scripts, mountPath: /setup, readOnly: true }
+          resources:
+            {{- toYaml .Values.resources.setup | nindent 12 }}
+      volumes:
+        - name: html
+          persistentVolumeClaim: { claimName: wordpress-data }
+        - name: scripts
+          configMap: { name: store-setup-scripts }

@@ -1,0 +1,6 @@
+Platform installed in namespace {{ .Release.Namespace }}.
+
+  MCP endpoint : {{ include "platform.publicUrl" . }}/mcp
+  First admin  : {{ .Values.admin.email }}. The API key is printed ONCE, in the log of the first start:
+      kubectl -n {{ .Release.Namespace }} logs deploy/gateway | grep -A3 "First admin"
+  Registered at start: {{ range .Values.servers }}{{ .slug }} ({{ .url }}) {{ end }}

@@ -1,0 +1,75 @@
+# The WooCommerce MCP server. Reachable only inside the cluster (a ClusterIP Service and NO Ingress), and the
+# NetworkPolicy lets only the gateway's pods connect to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: woo-mcp
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: woo-mcp
+spec:
+  selector:
+    app.kubernetes.io/name: woo-mcp
+  ports:
+    - { name: mcp, port: 8000, targetPort: mcp }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: woo-mcp
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: woo-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: woo-mcp
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" . | nindent 8 }}
+        app.kubernetes.io/name: woo-mcp
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      automountServiceAccountToken: false   # it never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: woo-mcp
+          image: {{ include "store.image" .Values.images.mcp }}
+          imagePullPolicy: {{ .Values.images.mcp.pullPolicy }}
+          ports:
+            - { name: mcp, containerPort: 8000 }
+          env:
+            - { name: WOO_BASE_URL, value: {{ include "store.internalUrl" . | quote }} }
+            - { name: STORE_TIMEZONE, value: {{ .Values.timezone | quote }} }
+            - name: WOO_CONSUMER_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.wordpress }}, key: WC_CONSUMER_KEY } }
+            - name: WOO_CONSUMER_SECRET
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.wordpress }}, key: WC_CONSUMER_SECRET } }
+            - name: MCP_SERVER_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.mcp }}, key: MCP_SERVER_TOKEN } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          # Ready = the store answers with our keys (so it stays "not ready" until the setup Job has registered them).
+          readinessProbe:
+            httpGet: { path: /readyz, port: mcp }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: mcp }
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources.mcp | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }

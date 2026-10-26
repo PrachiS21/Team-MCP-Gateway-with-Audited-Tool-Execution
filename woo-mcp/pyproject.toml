@@ -1,16 +1,18 @@
 [project]
 name = "woo-mcp"
 version = "0.1.0"
+authors = [{ name = "Prachi" }]
 description = "MCP server exposing a WooCommerce store's products and orders as tools"
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp",
     "httpx",
+    "uvicorn",  # imported by __main__.py (also arrives via fastmcp, but we use it directly)
     "tzdata",   # time zone data for slim container images that have none
 ]
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio", "pytest-timeout", "uvicorn"]
+dev = ["pytest", "pytest-asyncio", "pytest-timeout"]
 
 [build-system]
 requires = ["hatchling"]

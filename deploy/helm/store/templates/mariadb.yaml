@@ -1,0 +1,85 @@
+# The database. One replica; its data lives on a PersistentVolumeClaim, so it survives pod restarts,
+# `helm upgrade` and `helm rollback`.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mariadb-data
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mariadb
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- include "store.storageClass" . | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.dbSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mariadb
+spec:
+  selector:
+    app.kubernetes.io/name: mariadb
+  ports:
+    - { name: mysql, port: 3306, targetPort: mysql }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mariadb
+spec:
+  serviceName: mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mariadb
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mariadb
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      containers:
+        - name: mariadb
+          image: {{ include "store.image" .Values.images.mariadb }}
+          imagePullPolicy: {{ .Values.images.mariadb.pullPolicy }}
+          ports:
+            - { name: mysql, containerPort: 3306 }
+          env:
+            - { name: MARIADB_DATABASE, value: wordpress }
+            - { name: MARIADB_USER, value: wordpress }
+            - name: MARIADB_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.db }}, key: DB_PASSWORD } }
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.db }}, key: DB_ROOT_PASSWORD } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/mysql }
+          # The same check the Compose file uses. "Started" gives a slow first initialisation time (startup);
+          # "ready" takes the pod out of the Service when the database cannot answer; a failing "live" check restarts it.
+          startupProbe:
+            exec: { command: [healthcheck.sh, --connect, --innodb_initialized] }
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec: { command: [healthcheck.sh, --connect, --innodb_initialized] }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec: { command: [healthcheck.sh, --connect] }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources.mariadb | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: mariadb-data }

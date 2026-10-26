@@ -3,8 +3,14 @@
 Plaintext keys exist only in the return value of issue_key(); the database and
 every read method hold hashes or metadata. Revocation takes effect on the very
 next verify() because verify() reads the database each time.
+
+Dashboard sessions: logging in with an API key creates a session whose random token goes in an HttpOnly cookie
+(only its hash is stored). A session is valid only while its key is unrevoked and its user is active, so revoking
+the key or deactivating the user also ends the dashboard login on the next request.
 """
 
+import hashlib
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,10 +20,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from .keys import generate_key, hash_key, hashes_match, parse_key
-from .models import ApiKeyRow, Base, UserRow
+from .models import ApiKeyRow, Base, SessionRow, UserRow
 
 ROLES = ("admin", "member")
 _LAST_USED_RESOLUTION = timedelta(minutes=1)  # don't write to the DB on every request
+SESSION_TTL = timedelta(hours=8)
 
 
 class AuthError(ValueError):
@@ -70,6 +77,14 @@ def _info(r: ApiKeyRow) -> KeyInfo:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _aware(ts: datetime) -> datetime:
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)  # SQLite drops tz info
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 class AuthService:
@@ -150,6 +165,11 @@ class AuthService:
                 s.commit()
             return _info(row)
 
+    def get_key(self, key_id: str) -> KeyInfo | None:
+        with self._sessions() as s:
+            row = s.get(ApiKeyRow, key_id)
+            return _info(row) if row else None
+
     def list_keys(self, user_id: str) -> list[KeyInfo]:
         with self._sessions() as s:
             rows = s.scalars(select(ApiKeyRow).where(ApiKeyRow.user_id == user_id).order_by(ApiKeyRow.created_at))
@@ -177,6 +197,46 @@ class AuthService:
                 row.last_used_at = now
                 s.commit()
             return _user(user)
+
+    # -- dashboard sessions -----------------------------------------------
+
+    def start_session(self, key: str, now: datetime | None = None) -> tuple[str, User] | None:
+        """Log in with an API key. Returns (session token for the cookie, user), or None if the key is not valid."""
+        user = self.verify(key)
+        if user is None:
+            return None
+        now = now or _now()
+        token = secrets.token_urlsafe(32)
+        with self._sessions() as s:
+            s.add(SessionRow(token_hash=_token_hash(token), user_id=user.id, key_id=parse_key(key),
+                             created_at=now, expires_at=now + SESSION_TTL))
+            s.commit()
+        return token, user
+
+    def session_user(self, token: str, now: datetime | None = None) -> tuple[User, str] | None:
+        """(user, key_id) for a live session; None if unknown, expired, its key revoked or its user deactivated."""
+        if not token:
+            return None
+        with self._sessions() as s:
+            row = s.get(SessionRow, _token_hash(token))
+            if row is None:
+                return None
+            if _aware(row.expires_at) <= (now or _now()):
+                s.delete(row)
+                s.commit()
+                return None
+            key = s.get(ApiKeyRow, row.key_id)
+            user = s.get(UserRow, row.user_id)
+            if key is None or key.revoked_at is not None or user is None or not user.active:
+                return None
+            return _user(user), row.key_id
+
+    def end_session(self, token: str) -> None:
+        with self._sessions() as s:
+            row = s.get(SessionRow, _token_hash(token or ""))
+            if row is not None:
+                s.delete(row)
+                s.commit()
 
     # -- bootstrap --------------------------------------------------------
 

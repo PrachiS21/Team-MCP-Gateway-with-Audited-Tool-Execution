@@ -1,0 +1,37 @@
+# Public entry: /mcp (MCP clients) and /api (the dashboard's API). /healthz and /readyz are deliberately NOT routed:
+# only the kubelet needs them. The dashboard is served at / (its nginx answers unknown paths, such as /healthz, with 404).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: platform
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ required "set .Values.host" .Values.host | quote }}]
+      secretName: {{ required "set ingress.tls.secretName when tls is enabled" .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ required "set .Values.host" .Values.host | quote }}
+      http:
+        paths:
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service: { name: gateway, port: { name: http } }
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: gateway, port: { name: http } }
+          {{- if .Values.dashboard.enabled }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: dashboard, port: { name: http } }
+          {{- end }}

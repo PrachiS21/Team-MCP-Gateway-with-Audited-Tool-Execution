@@ -1,0 +1,132 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default deny, then: Traefik -> gateway:8000; gateway -> woo-mcp:8000 in the listed store namespaces and -> the
+# upstreams in this namespace; upstreams accept only the gateway and open nothing; everyone -> DNS.
+# Anything else is dropped, including the gateway reaching the internet. The chat agent's LLM endpoint
+# will need a rule: put it in networkPolicy.extraEgress.
+{{- $np := .Values.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ $np.dns.namespace }} }
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.dns.podLabels | nindent 14 }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: gateway }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ $np.ingressController.namespace }} }
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.ingressController.podLabels | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8000 }
+  egress:
+    {{- range $np.storeNamespaces }}
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ . }} }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: woo-mcp }
+      ports:
+        - { protocol: TCP, port: 8000 }
+    {{- end }}
+    {{- if .Values.upstreams }}
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/component: upstream }
+      ports:
+        {{- range .Values.upstreams }}
+        - { protocol: TCP, port: {{ .port }} }
+        {{- end }}
+    {{- end }}
+    {{- if .Values.llm.model }}
+    # The chat agent's LLM: HTTPS to public addresses only (the excepted ranges are the cluster, LANs and cloud metadata).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 127.0.0.0/8]
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- end }}
+    {{- with $np.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- if .Values.dashboard.enabled }}
+---
+# The dashboard serves static files only: Traefik may connect, and it opens no connections at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dashboard
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: dashboard }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ $np.ingressController.namespace }} }
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.ingressController.podLabels | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress: []
+{{- end }}
+{{- range .Values.upstreams }}
+---
+# {{ .name }}: only the gateway may connect; it may open no connections itself (DNS aside, see allow-dns).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: upstream-{{ .name }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: {{ .name }} }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: gateway }
+      ports:
+        - { protocol: TCP, port: {{ .port }} }
+  egress: []
+{{- end }}
+{{- end }}

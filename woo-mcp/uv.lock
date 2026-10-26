@@ -1684,6 +1684,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "tzdata" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -1691,7 +1692,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
-    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -1699,6 +1699,7 @@ requires-dist = [
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "tzdata" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata.requires-dev]
@@ -1706,7 +1707,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
-    { name = "uvicorn" },
 ]
 
 [[package]]

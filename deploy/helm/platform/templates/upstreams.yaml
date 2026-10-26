@@ -1,0 +1,91 @@
+# Upstream MCP servers that run next to the gateway (see .Values.upstreams). Internal only: ClusterIP Services, no
+# Ingress, and the NetworkPolicy in networkpolicy.yaml admits only the gateway and lets them open no connections.
+{{- range .Values.upstreams }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ .name }}
+    app.kubernetes.io/component: upstream
+spec:
+  selector:
+    app.kubernetes.io/name: {{ .name }}
+  ports:
+    - { name: mcp, port: {{ .port }}, targetPort: mcp }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ .name }}
+    app.kubernetes.io/component: upstream
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .name }}
+  template:
+    metadata:
+      labels:
+        {{- include "platform.labels" $ | nindent 8 }}
+        app.kubernetes.io/name: {{ .name }}
+        app.kubernetes.io/component: upstream
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .uid }}
+        runAsGroup: {{ .uid }}
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: {{ .name }}
+          image: {{ include "platform.image" .image }}
+          imagePullPolicy: {{ .image.pullPolicy }}
+          ports:
+            - { name: mcp, containerPort: {{ .port }} }
+          env:
+            - { name: MCP_PORT, value: {{ .port | quote }} }
+            {{- range $k, $v := .env }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+            {{- if .tokenKey }}
+            - name: MCP_SERVER_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ $.Values.secrets.gateway }}, key: {{ .tokenKey }} } }
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          {{- if eq .probes "http" }}
+          readinessProbe:
+            httpGet: { path: /readyz, port: mcp }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: mcp }
+            periodSeconds: 20
+            timeoutSeconds: 5
+          {{- else }}
+          readinessProbe:
+            tcpSocket: { port: mcp }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: mcp }
+            periodSeconds: 20
+            timeoutSeconds: 5
+          {{- end }}
+          resources:
+            {{- toYaml .resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
+{{- end }}

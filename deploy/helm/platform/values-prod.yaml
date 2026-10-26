@@ -1,0 +1,10 @@
+host: app.example.com
+scheme: https
+ingress:
+  tls: { enabled: true, secretName: platform-tls }   # a Secret holding the certificate (cert-manager can create it)
+images:
+  gateway: { repository: ghcr.io/CHANGE-ME/gateway, tag: "0.1.0", pullPolicy: IfNotPresent }
+storage:
+  gatewaySize: 5Gi
+resources:
+  gateway: { requests: { cpu: 250m, memory: 384Mi }, limits: { cpu: 1000m, memory: 768Mi } }

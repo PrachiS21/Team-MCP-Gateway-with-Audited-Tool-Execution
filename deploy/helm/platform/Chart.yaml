@@ -1,0 +1,6 @@
+apiVersion: v2
+name: platform
+description: The MCP gateway (and, later, the dashboard) that all stores' MCP servers sit behind
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

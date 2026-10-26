@@ -1,0 +1,13 @@
+# VPS running k3s. Same chart, different values.
+host: shop.example.com            # a real domain with a DNS A record to the VPS
+scheme: https
+ingress:
+  tls: { enabled: true, secretName: store-main-tls }   # a Secret holding the certificate (cert-manager can create it)
+images:
+  mcp: { repository: ghcr.io/CHANGE-ME/woo-mcp, tag: "0.1.0", pullPolicy: IfNotPresent }   # pushed to a registry
+storage:
+  dbSize: 20Gi
+  wordpressSize: 20Gi
+resources:
+  mariadb:   { requests: { cpu: 250m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  wordpress: { requests: { cpu: 250m, memory: 512Mi }, limits: { cpu: 2000m, memory: 1Gi } }

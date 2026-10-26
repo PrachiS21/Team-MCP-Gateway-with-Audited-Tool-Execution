@@ -1,0 +1,6 @@
+apiVersion: v2
+name: store
+description: One WooCommerce store (MariaDB, WordPress + WooCommerce, and its MCP server) in its own namespace
+type: application
+version: 0.1.0        # the chart's own version; bump when the templates change
+appVersion: "11.2.1"  # the WooCommerce version this chart is verified against

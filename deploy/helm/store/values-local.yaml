@@ -1,0 +1,6 @@
+# Local k3d cluster on the HP. sslip.io turns <name>.<ip>.sslip.io into <ip>, so no hosts-file editing.
+# Replace 192.168.1.11 with the HP's LAN address if it changes.
+host: shop.192.168.1.11.sslip.io
+scheme: http
+images:
+  mcp: { repository: woo-mcp, tag: dev, pullPolicy: IfNotPresent }   # built on the HP, imported into k3d

@@ -100,3 +100,26 @@ async def test_server_dying_after_a_live_connection_is_unreachable_not_generic(f
     assert second.error.kind is ErrorKind.UNREACHABLE
     await fake.start()
     await c.close()
+
+
+def _chained(outer: BaseException, inner: BaseException) -> BaseException:
+    try:
+        try:
+            raise inner
+        except BaseException:
+            raise outer
+    except BaseException as e:
+        return e
+
+
+def test_a_timeout_wrapped_by_the_sdk_is_a_timeout_not_unreachable():
+    """Seen against the real "everything" server on a reused session: FastMCP's own request timeout raises
+    MCPError(-32001) with the TimeoutError underneath. TimeoutError is also an OSError, which used to make this
+    look like "unreachable"."""
+    from mcp.shared.exceptions import MCPError
+
+    from gateway.mcp.upstream_client import _classify
+    sdk = _chained(MCPError(-32001, "Request 'tools/call' timed out"), TimeoutError())
+    assert _classify(sdk).kind is ErrorKind.TIMEOUT
+    assert _classify(_chained(RuntimeError("wrapper"), TimeoutError())).kind is ErrorKind.TIMEOUT
+    assert _classify(ConnectionRefusedError()).kind is ErrorKind.UNREACHABLE  # real connection errors unchanged

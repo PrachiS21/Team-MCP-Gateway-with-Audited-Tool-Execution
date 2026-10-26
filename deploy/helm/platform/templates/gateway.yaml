@@ -1,0 +1,123 @@
+# The MCP gateway. One replica with a Recreate rollout: its databases are SQLite files on a volume that
+# only one pod can use at a time. The root filesystem is read-only; the only writable places are the
+# volume at /data (registry, audit log, undo jobs, incident log) and an in-memory /tmp.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-seed
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+data:
+  seed.json: |
+    {{- include "platform.seed" . | nindent 4 }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gateway-data
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.storage.className }}
+  storageClassName: {{ .Values.storage.className | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.gatewaySize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "platform.labels" . | nindent 8 }}
+        app.kubernetes.io/name: gateway     # the store's NetworkPolicy lets pods with this label call woo-mcp
+      annotations:
+        # The seed file is read at start only, so a changed file must restart the pod.
+        checksum/seed: {{ include "platform.seed" . | sha256sum }}
+    spec:
+      enableServiceLinks: false   # no <SERVICE>_PORT=tcp://... variables: they collided with GATEWAY_PORT (seen on the HP)
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          image: {{ include "platform.image" .Values.images.gateway }}
+          imagePullPolicy: {{ .Values.images.gateway.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: GATEWAY_ADMIN_EMAIL, value: {{ .Values.admin.email | quote }} }
+            - { name: GATEWAY_SEED_FILE, value: /config/seed.json }
+            - { name: GATEWAY_COOKIE_SECURE, value: {{ eq .Values.scheme "https" | ternary "1" "0" | quote }} }  # cookies over HTTPS only, when served over HTTPS
+            - name: GATEWAY_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.gateway }}, key: GATEWAY_SECRET_KEY } }
+            {{- if .Values.llm.model }}
+            - { name: GATEWAY_LLM_BASE_URL, value: {{ .Values.llm.baseUrl | quote }} }
+            - { name: GATEWAY_LLM_MODEL, value: {{ .Values.llm.model | quote }} }
+            - name: GATEWAY_LLM_API_KEY   # optional: no key yet = the chat says "not configured"; the gateway still starts
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.gateway }}, key: LLM_API_KEY, optional: true } }
+            {{- end }}
+            {{- /* one variable per server credential named in the values, each filled from the same-named Secret key */}}
+            {{- range .Values.servers }}
+            {{- if .credentialEnv }}
+            - name: {{ .credentialEnv }}
+              valueFrom: { secretKeyRef: { name: {{ $.Values.secrets.gateway }}, key: {{ .credentialEnv }} } }
+            {{- end }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+            - { name: seed, mountPath: /config, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources.gateway | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: gateway-data }
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
+        - name: seed
+          configMap: { name: gateway-seed }

@@ -7,6 +7,7 @@ method that decrypts, `upstream_config`, exists for the manager.
 
 import builtins  # noqa: F401  (used in a string annotation)
 import uuid
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -45,6 +46,23 @@ class _Server(_Base):
     credential_enc: Mapped[str | None] = mapped_column(Text, nullable=True)  # encrypted
     timeout: Mapped[float] = mapped_column(Float, default=10.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+@dataclass(frozen=True)
+class ServerChange:
+    """What sync_server() did. `details` is safe to log and store: it never holds a secret value."""
+
+    slug: str
+    action: str  # "created" | "updated"
+    changed: tuple[str, ...]  # field NAMES that changed ("credential" means the secret changed; its value is not here)
+    details: dict
+
+
+def safe_url(url: str) -> str:
+    """scheme://host:port/path only: no user:password@ part, no query string, no fragment."""
+    p = urlsplit(url)
+    host = p.hostname or ""
+    return f"{p.scheme}://{host}{':' + str(p.port) if p.port else ''}{p.path}"
 
 
 @dataclass(frozen=True)
@@ -175,6 +193,47 @@ class ServerRegistry:
         if row is None:
             raise RegistryError(f"unknown server id {server_id!r}")
         return row
+
+    # -- sync from a seed file ---------------------------------------------
+
+    def validate_entry(self, *, slug: str, url: str, credential_type: str, credential: str | None,
+                       credential_header: str | None) -> None:
+        """Run the same checks create() would (slug, URL policy, credential combination), without saving."""
+        self._validate(slug, url, credential_type, credential_header, credential)
+
+    def sync_server(self, *, slug: str, name: str, url: str, credential_type: str, credential: str | None,
+                    credential_header: str | None, timeout: float) -> "ServerChange | None":
+        """Make the server with this SLUG match the given values. The slug is the match key; the
+        enabled/disabled switch is never touched. Returns None when nothing changed."""
+        try:
+            existing = self.get_by_slug(slug)
+        except RegistryError:
+            self.create(name=name, slug=slug, url=url, credential_type=credential_type, credential=credential,
+                        credential_header=credential_header, timeout=timeout)
+            return ServerChange(slug, "created", (), {"url": safe_url(url), "credential_type": credential_type})
+
+        current = self.upstream_config(existing.id).credential  # decrypted only to compare, never exposed
+        header_now = existing.credential_header if existing.credential_type == "header" else None
+        header_new = credential_header if credential_type == "header" else None
+        changed: list[str] = []
+        details: dict = {}
+        if existing.name != name:
+            changed.append("name"); details["name"] = {"from": existing.name, "to": name}
+        if existing.url != url:
+            changed.append("url"); details["url"] = {"from": safe_url(existing.url), "to": safe_url(url)}
+        if existing.credential_type != credential_type:
+            changed.append("credential_type"); details["credential_type"] = {"from": existing.credential_type, "to": credential_type}
+        if header_now != header_new:
+            changed.append("credential_header"); details["credential_header"] = {"from": header_now, "to": header_new}
+        if current != credential:
+            changed.append("credential")  # the VALUE is deliberately not recorded anywhere
+        if existing.timeout != timeout:
+            changed.append("timeout"); details["timeout"] = {"from": existing.timeout, "to": timeout}
+        if not changed:
+            return None
+        self.update(existing.id, name=name, url=url, credential_type=credential_type, credential=credential,
+                    credential_header=credential_header, timeout=timeout)
+        return ServerChange(slug, "updated", tuple(changed), details)
 
     # -- bridge to the manager -------------------------------------------
 

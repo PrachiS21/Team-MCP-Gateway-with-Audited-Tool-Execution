@@ -1,0 +1,27 @@
+# The storefront and wp-admin, on one stable host name. Only WordPress is exposed; the database and the MCP server have no Ingress.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: wordpress
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ required "set .Values.host" .Values.host | quote }}]
+      secretName: {{ required "set ingress.tls.secretName when tls is enabled" .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ required "set .Values.host" .Values.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: wordpress, port: { name: http } }

@@ -1,0 +1,90 @@
+# A real WooCommerce store for checking that our MCP server works against the real thing.
+# Same setup script (store/setup-store.sh) that the Helm chart's init container will reuse.
+#
+#   ./make-env.sh http://<this-machine-ip>:8080     # writes .env (random passwords, never commit it)
+#   docker compose up -d
+#   docker compose logs -f setup                    # wait for "[setup] done"
+#
+# Image tags track a major version on purpose for this check; the Helm chart pins them exactly (WordPress must
+# satisfy the WooCommerce version's "requires WordPress" field).
+name: wc-store
+
+services:
+  db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  wordpress:
+    # WooCommerce 11.x needs WordPress 7.0 or newer (checked against api.wordpress.org on 2026-10-22). A "6-apache"
+    # tag only ever gives 6.x and makes the plugin install refuse. Before pinning exactly (Helm chart), re-check:
+    #   curl -s https://api.wordpress.org/plugins/info/1.0/woocommerce.json   (fields: version, requires)
+    image: wordpress:7-apache
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${WP_PORT:-8080}:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: ${DB_NAME}
+      WORDPRESS_DB_USER: ${DB_USER}
+      WORDPRESS_DB_PASSWORD: ${DB_PASSWORD}
+      # Written into wp-config.php. WooCommerce accepts consumer-key Basic auth only over HTTPS; the MCP
+      # server sends X-Forwarded-Proto: https on its plain-HTTP hop, so tell WordPress to believe it.
+      # ($$ is how compose writes a literal $.)
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_HOME', '${WP_URL}');
+        define('WP_SITEURL', '${WP_URL}');
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+            $$_SERVER['HTTPS'] = 'on';
+        }
+    volumes:
+      - wp_data:/var/www/html
+      # Keep the WooCommerce consumer key out of Apache's access log (same file as the Helm chart; see the file).
+      - ./store/hide-auth-user.conf:/etc/apache2/conf-enabled/zz-hide-auth-user.conf:ro
+
+  # One-shot: installs and configures WordPress + WooCommerce, then exits. Safe to re-run.
+  setup:
+    image: wordpress:cli
+    depends_on:
+      wordpress:
+        condition: service_started
+    user: "33:33"   # www-data, the owner of the WordPress files
+    restart: "no"
+    environment:
+      # wp-config.php (written by the wordpress container) reads these at RUN time, not at creation, so WP-CLI
+      # needs them too. Without them it silently falls back to host "mysql" and fails to connect.
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: ${DB_NAME}
+      WORDPRESS_DB_USER: ${DB_USER}
+      WORDPRESS_DB_PASSWORD: ${DB_PASSWORD}
+      WP_URL: ${WP_URL}
+      WP_TITLE: ${WP_TITLE}
+      WP_ADMIN_USER: ${WP_ADMIN_USER}
+      WP_ADMIN_PASSWORD: ${WP_ADMIN_PASSWORD}
+      WP_ADMIN_EMAIL: ${WP_ADMIN_EMAIL}
+      WP_TIMEZONE: ${WP_TIMEZONE}
+      WC_VERSION: ${WC_VERSION:-}
+      WC_CONSUMER_KEY: ${WC_CONSUMER_KEY}
+      WC_CONSUMER_SECRET: ${WC_CONSUMER_SECRET}
+    volumes:
+      - wp_data:/var/www/html
+      - ./store:/setup:ro
+    entrypoint: ["sh", "/setup/setup-store.sh"]
+
+volumes:
+  db_data:
+  wp_data:

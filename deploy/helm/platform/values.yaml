@@ -1,0 +1,96 @@
+# Defaults shared by every environment. Differences go in values-local.yaml / values-prod.yaml.
+# No secret value belongs in any values file: the chart refers to Secrets by name.
+
+# Where people and MCP clients reach the platform. One host: dashboard at /, gateway at /api and /mcp.
+host: ""                   # set per environment, e.g. app.192.168.1.11.sslip.io
+scheme: http
+timezone: Asia/Kolkata
+
+admin:
+  email: admin@example.com   # the first admin; an API key is issued at the first start and printed ONCE in the pod log
+
+ingress:
+  className: traefik
+  tls:
+    enabled: false           # production: true, with a Secret holding the certificate
+    secretName: ""
+  annotations: {}
+
+# NetworkPolicies: default deny, then only what the gateway needs (see templates/networkpolicy.yaml).
+networkPolicy:
+  enabled: true
+  ingressController:
+    namespace: kube-system
+    podLabels: { app.kubernetes.io/name: traefik }
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
+  storeNamespaces: [store-main]   # namespaces whose woo-mcp pods the gateway may call; add one per store
+  extraEgress: []                 # raw NetworkPolicy egress rules, e.g. for the LLM endpoint the chat agent will call
+
+# The chat agent's LLM (backend/src/gateway/chat.py): any OpenAI-compatible endpoint. The chat is ON only when `model`
+# is set here AND the Secret holds LLM_API_KEY (scripts/set-llm-key.sh puts it there). When on, the gateway may open
+# HTTPS (443) connections to PUBLIC addresses only; private, cluster and metadata ranges stay blocked. A model on your
+# own network (e.g. Ollama) needs a networkPolicy.extraEgress rule instead.
+llm:
+  baseUrl: https://api.groq.com/openai/v1
+  model: ""                       # empty = chat off. Set it in values-local.yaml / values-prod.yaml
+
+images:
+  gateway:   { repository: gateway, tag: dev, pullPolicy: IfNotPresent }
+  dashboard: { repository: dashboard, tag: dev, pullPolicy: IfNotPresent }
+
+dashboard:
+  enabled: true            # the React dashboard (frontend/), served by an unprivileged nginx at /
+
+storage:
+  className: ""            # empty = the cluster default (k3s: local-path)
+  gatewaySize: 1Gi         # SQLite files: registry, audit log, undo jobs, incident log
+
+# Servers registered at startup (the gateway's seed file is built from this). Credentials are NOT here:
+# each entry names an environment variable that is filled from a Secret.
+servers:
+  - slug: woo
+    name: WooCommerce (main)
+    url: http://woo-mcp.store-main.svc.cluster.local:8000/mcp
+    credentialType: bearer          # the token comes from the environment variable below, filled from the Secret
+    credentialEnv: WOO_MCP_TOKEN    # must also be a key in secrets.gateway
+  - slug: gst
+    name: GST calculator
+    url: http://gst.platform.svc.cluster.local:8000/mcp
+    credentialType: bearer
+    credentialEnv: GST_MCP_TOKEN
+  - slug: everything
+    name: MCP reference server (third-party, untrusted)
+    url: http://everything.platform.svc.cluster.local:3001/mcp
+    # no credential: this server has no authentication; only the NetworkPolicy protects it
+
+# Extra upstream MCP servers that run in THIS namespace (templates/upstreams.yaml). Each gets a Deployment and a
+# ClusterIP Service named after it, accepts traffic only from the gateway, and may not open outbound connections.
+upstreams:
+  - name: gst
+    image: { repository: gst-mcp, tag: dev, pullPolicy: IfNotPresent }
+    port: 8000
+    uid: 10001
+    probes: http                   # GET /healthz (live) and /readyz (ready)
+    tokenKey: GST_MCP_TOKEN        # key in secrets.gateway, given to the pod as MCP_SERVER_TOKEN
+    env: { STORE_STATE: MH }
+    resources: { requests: { cpu: 25m, memory: 80Mi }, limits: { cpu: 200m, memory: 160Mi } }
+  - name: everything
+    image: { repository: everything-mcp, tag: dev, pullPolicy: IfNotPresent }
+    port: 3001
+    uid: 1000                      # the "node" user of the official Node image
+    probes: tcp                    # it has no health endpoint, so check that the port answers
+    env: {}
+    resources: { requests: { cpu: 25m, memory: 96Mi }, limits: { cpu: 250m, memory: 256Mi } }
+
+secrets:
+  gateway: gateway-secrets     # GATEWAY_SECRET_KEY, WOO_MCP_TOKEN (same value as the store's MCP_SERVER_TOKEN), GST_MCP_TOKEN
+
+resources:
+  gateway:   { requests: { cpu: 100m, memory: 192Mi }, limits: { cpu: 500m, memory: 384Mi } }
+  dashboard: { requests: { cpu: 25m,  memory: 32Mi  }, limits: { cpu: 100m, memory: 64Mi } }
+
+limitRange:
+  default:        { cpu: 250m, memory: 256Mi }
+  defaultRequest: { cpu: 50m,  memory: 64Mi }

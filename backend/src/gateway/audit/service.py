@@ -4,17 +4,18 @@ record() raises if the write fails. Whether a failed audit write should fail the
 call (fail closed) or only be logged (fail open) is decided by the caller, not here.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
-from .models import AuditRow, Base
+from .models import AdminEventRow, AuditRow, Base
 
 OUTCOMES = ("started", "success", "tool_error", "error", "auth_failed", "denied")
 # "started" is the write-ahead row; a row that stays "started" means the process died mid-call.
-SOURCES = ("mcp", "chat")
+SOURCES = ("mcp", "chat", "api")  # api = dashboard login attempts
 MAX_PAGE = 500
 
 
@@ -36,6 +37,21 @@ class AuditEntry:
     outcome: str
     error_kind: str | None
     source: str
+
+
+@dataclass(frozen=True)
+class AdminEvent:
+    id: int
+    ts: datetime
+    actor: str
+    action: str
+    server_slug: str | None
+    details: dict
+
+
+def _event(r: AdminEventRow) -> AdminEvent:
+    ts = r.ts if r.ts.tzinfo else r.ts.replace(tzinfo=timezone.utc)
+    return AdminEvent(r.id, ts, r.actor, r.action, r.server_slug, json.loads(r.details or "{}"))
 
 
 def _entry(r: AuditRow) -> AuditEntry:
@@ -116,3 +132,29 @@ class AuditLog:
         stmt = self._filtered(select(func.count(AuditRow.id)), user_id, server_slug, tool, outcome, since, until)
         with self._sessions() as s:
             return s.scalar(stmt) or 0
+
+    # -- admin events (configuration changes) ------------------------------------
+
+    def record_event(self, *, actor: str, action: str, server_slug: str | None = None,
+                     details: dict | None = None, ts: datetime | None = None) -> AdminEvent:
+        """Record a configuration change. `details` must never contain secret values."""
+        row = AdminEventRow(ts=ts or datetime.now(timezone.utc), actor=actor, action=action,
+                            server_slug=server_slug, details=json.dumps(details or {}))
+        with self._sessions() as s:
+            s.add(row)
+            s.commit()
+        return _event(row)
+
+    def events(self, *, server_slug: str | None = None, action: str | None = None,
+               since: datetime | None = None, limit: int = 100, offset: int = 0) -> list[AdminEvent]:
+        """Newest first."""
+        stmt = select(AdminEventRow)
+        if server_slug is not None:
+            stmt = stmt.where(AdminEventRow.server_slug == server_slug)
+        if action is not None:
+            stmt = stmt.where(AdminEventRow.action == action)
+        if since is not None:
+            stmt = stmt.where(AdminEventRow.ts >= since)
+        stmt = stmt.order_by(AdminEventRow.ts.desc(), AdminEventRow.id.desc()).limit(max(1, min(limit, MAX_PAGE))).offset(max(0, offset))
+        with self._sessions() as s:
+            return [_event(r) for r in s.scalars(stmt)]
