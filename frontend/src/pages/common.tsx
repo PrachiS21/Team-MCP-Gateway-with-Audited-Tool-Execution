@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api";
 
 export interface PageProps { onUnauthorized: () => void }
@@ -8,10 +8,14 @@ export function useLoad<T>(load: () => Promise<T>, onUnauthorized: () => void) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // reload() is created once, so it must call the LATEST load function (which sees the page's current filters),
+  // not the one from the first render.
+  const loadRef = useRef(load);
+  loadRef.current = load;
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await load());
+      setData(await loadRef.current());
       setError(null);
     } catch (e) {
       if (e instanceof ApiError && (e.status === 401 || e.status === 403)) onUnauthorized();

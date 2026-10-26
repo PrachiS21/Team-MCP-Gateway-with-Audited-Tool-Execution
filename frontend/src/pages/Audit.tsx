@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, User, when } from "../api";
 import { ErrorBox, PageProps, useLoad } from "./common";
 
@@ -6,12 +6,21 @@ const PAGE = 50;
 
 export function Audit({ user, onUnauthorized }: PageProps & { user: User }) {
   const admin = user.role === "admin";
+  // What is typed in the boxes, and what was last applied with Filter (or a page button). Only the applied one is sent.
   const [filter, setFilter] = useState({ user: "", server: "", outcome: "" });
-  const [offset, setOffset] = useState(0);
-  const calls = useLoad(() => api.audit({ ...filter, limit: PAGE, offset }), onUnauthorized);
+  const [applied, setApplied] = useState({ user: "", server: "", outcome: "", offset: 0 });
+  const offset = applied.offset;
+  const calls = useLoad(() => api.audit({ ...applied, limit: PAGE }), onUnauthorized);
   const events = useLoad(() => (admin ? api.events(30) : Promise.resolve({ events: [] })), onUnauthorized);
 
-  const apply = (o = 0) => { setOffset(o); setTimeout(() => void calls.reload(), 0); };
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }  // the first load is done by useLoad
+    void calls.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applied]);
+
+  const apply = () => setApplied({ user: filter.user.trim(), server: filter.server.trim(), outcome: filter.outcome, offset: 0 });
   const set = (k: keyof typeof filter) => (e: { target: { value: string } }) => setFilter({ ...filter, [k]: e.target.value });
 
   return (
@@ -25,7 +34,7 @@ export function Audit({ user, onUnauthorized }: PageProps & { user: User }) {
           <option value="">any outcome</option>
           {["success", "tool_error", "error", "auth_failed", "denied", "started"].map((o) => <option key={o}>{o}</option>)}
         </select>
-        <button onClick={() => apply(0)}>Filter</button>
+        <button onClick={apply}>Filter</button>
       </div>
       <ErrorBox error={calls.error} />
       <table>
@@ -44,9 +53,9 @@ export function Audit({ user, onUnauthorized }: PageProps & { user: User }) {
       </table>
       {calls.data && (
         <div className="row">
-          <button disabled={offset === 0} onClick={() => apply(Math.max(0, offset - PAGE))}>Newer</button>
+          <button disabled={offset === 0} onClick={() => setApplied({ ...applied, offset: Math.max(0, offset - PAGE) })}>Newer</button>
           <span>{calls.data.total ? `${offset + 1}–${Math.min(offset + PAGE, calls.data.total)} of ${calls.data.total}` : "no calls"}</span>
-          <button disabled={offset + PAGE >= calls.data.total} onClick={() => apply(offset + PAGE)}>Older</button>
+          <button disabled={offset + PAGE >= calls.data.total} onClick={() => setApplied({ ...applied, offset: offset + PAGE })}>Older</button>
         </div>
       )}
 
