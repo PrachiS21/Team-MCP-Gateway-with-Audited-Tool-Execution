@@ -26,7 +26,8 @@ the servers' credentials, and every tool call is in an audit log.
 | Scripts: cluster, images, secrets, deploy, demo client | `scripts/` |
 | Docker Compose store used for the early contract tests | `deploy/compose/` |
 
-Documents: [System design and trade-offs](docs/design.md) · [Threat model](docs/threat-model.md) ·
+Documents: [Architecture diagrams](docs/architecture.html) (download and open in a browser: high-level design, then
+five low-level designs) · [System design and trade-offs](docs/design.md) · [Threat model](docs/threat-model.md) ·
 [Status codes and error meanings](Status_Codes.md) · [Script reference](scripts/README.md)
 
 ---
