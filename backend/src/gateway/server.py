@@ -22,6 +22,7 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
 from fastmcp.tools import Tool, ToolResult
 from mcp.types import TextContent
+from starlette.middleware import Middleware as ASGIMiddleware  # not fastmcp's Middleware (imported above)
 from starlette.responses import JSONResponse
 
 from gateway.api import register_api
@@ -34,6 +35,7 @@ from gateway.config import Settings
 from gateway.incidents import IncidentLog
 from gateway.jobs import UndoJobStore
 from gateway.locks import KeyedLocks
+from gateway.logs import TraceMiddleware
 from gateway.mcp.manager import UpstreamManager
 from gateway.registry.crypto import SecretBox
 from gateway.registry.registry import ServerRegistry
@@ -120,7 +122,8 @@ class Gateway:
     api_routes: list  # (method, path, access) of every /api route
 
     def http_app(self):
-        return self.mcp.http_app(path="/mcp", stateless_http=True)
+        # TraceMiddleware: lines logged while a request is handled carry its trace id (see logs.py)
+        return self.mcp.http_app(path="/mcp", stateless_http=True, middleware=[ASGIMiddleware(TraceMiddleware)])
 
 
 def create_gateway(settings: Settings, compensations: CompensationRegistry | None = None,

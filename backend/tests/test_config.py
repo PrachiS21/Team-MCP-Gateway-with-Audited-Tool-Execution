@@ -16,3 +16,19 @@ def test_port_comes_from_gateway_port_then_port(monkeypatch, env, port):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert Settings.from_env().port == port
+
+
+@pytest.mark.parametrize("value, expected", [(None, "text"), ("", "text"), ("json", "json"), ("text", "text")])
+def test_log_format_defaults_to_text(monkeypatch, value, expected):
+    monkeypatch.setenv("GATEWAY_SECRET_KEY", "test-key")
+    monkeypatch.delenv("GATEWAY_LOG_FORMAT", raising=False)
+    if value is not None:
+        monkeypatch.setenv("GATEWAY_LOG_FORMAT", value)
+    assert Settings.from_env().log_format == expected
+
+
+def test_an_unknown_log_format_stops_the_gateway_with_a_clear_message(monkeypatch):
+    monkeypatch.setenv("GATEWAY_SECRET_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_LOG_FORMAT", "JSON ")
+    with pytest.raises(SystemExit, match="GATEWAY_LOG_FORMAT must be one of text, json"):
+        Settings.from_env()

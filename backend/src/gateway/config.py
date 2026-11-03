@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from gateway.logs import LOG_FORMATS
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -26,6 +28,8 @@ class Settings:
     llm_model: str | None = None  # GATEWAY_LLM_MODEL, e.g. a tool-calling model your provider offers
     llm_api_key: str | None = field(default=None, repr=False)  # GATEWAY_LLM_API_KEY: from a Kubernetes Secret
     llm_timeout: float = 60.0  # GATEWAY_LLM_TIMEOUT: seconds per LLM request
+    log_format: str = "text"  # GATEWAY_LOG_FORMAT: "text" (readable) or "json" (one object per line, for Cloud Logging)
+    gcp_project: str | None = None  # GATEWAY_GCP_PROJECT: with json logs, links each line to its request's trace
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -34,6 +38,9 @@ class Settings:
         if not key:
             raise SystemExit("GATEWAY_SECRET_KEY is not set. Generate one with: "
                              "python -c 'from gateway.registry.crypto import generate_key; print(generate_key())'")
+        log_format = env.get("GATEWAY_LOG_FORMAT") or cls.log_format
+        if log_format not in LOG_FORMATS:
+            raise SystemExit(f"GATEWAY_LOG_FORMAT must be one of {', '.join(LOG_FORMATS)}")
         return cls(
             secret_key=key,
             db_url=env.get("GATEWAY_DB_URL", cls.db_url),
@@ -52,4 +59,6 @@ class Settings:
             llm_model=env.get("GATEWAY_LLM_MODEL") or None,
             llm_api_key=env.get("GATEWAY_LLM_API_KEY") or None,
             llm_timeout=float(env.get("GATEWAY_LLM_TIMEOUT", cls.llm_timeout)),
+            log_format=log_format,
+            gcp_project=env.get("GATEWAY_GCP_PROJECT") or None,
         )
