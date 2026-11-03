@@ -179,10 +179,14 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
     mcp = FastMCP("gateway", auth=GatewayKeyVerifier(auth, audit), middleware=[GatewayMiddleware(service)],
                   lifespan=lifespan)
 
+    # Each probe has two paths. Kubernetes uses the "z" ones; Cloud Run's front end reserves paths ending in "z"
+    # (they answer Google's own 404 from outside), so Cloud Run probes and uptime checks use /health and /ready.
+    @mcp.custom_route("/health", methods=["GET"])
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_request):  # liveness: the process is up
         return JSONResponse({"status": "ok"})
 
+    @mcp.custom_route("/ready", methods=["GET"])
     @mcp.custom_route("/readyz", methods=["GET"])
     async def readyz(_request):  # readiness: the database answers
         try:

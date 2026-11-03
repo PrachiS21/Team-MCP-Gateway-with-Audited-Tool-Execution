@@ -14,7 +14,7 @@ class Settings:
     admin_email: str | None = None  # GATEWAY_ADMIN_EMAIL: first admin, created at startup
     allow_loopback: bool = False  # GATEWAY_ALLOW_LOOPBACK=1: dev only, lets upstream URLs point at localhost
     host: str = "0.0.0.0"  # GATEWAY_HOST
-    port: int = 8000  # GATEWAY_PORT
+    port: int = 8000  # GATEWAY_PORT, else PORT (set by Cloud Run)
     incident_log: Path | None = None  # GATEWAY_INCIDENT_LOG: JSONL file that survives an audit DB outage
     worker_interval: float = 2.0  # GATEWAY_WORKER_INTERVAL: seconds between undo-worker passes
     sync_interval: float = 5.0  # GATEWAY_SYNC_INTERVAL: seconds between registry -> live-server syncs
@@ -41,7 +41,7 @@ class Settings:
             admin_email=env.get("GATEWAY_ADMIN_EMAIL") or None,
             allow_loopback=env.get("GATEWAY_ALLOW_LOOPBACK", "") in ("1", "true", "yes"),
             host=env.get("GATEWAY_HOST", cls.host),
-            port=int(env.get("GATEWAY_PORT", cls.port)),
+            port=int(env.get("GATEWAY_PORT") or env.get("PORT") or cls.port),
             incident_log=Path(env["GATEWAY_INCIDENT_LOG"]) if env.get("GATEWAY_INCIDENT_LOG") else None,
             worker_interval=float(env.get("GATEWAY_WORKER_INTERVAL", cls.worker_interval)),
             sync_interval=float(env.get("GATEWAY_SYNC_INTERVAL", cls.sync_interval)),

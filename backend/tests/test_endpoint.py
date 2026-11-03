@@ -184,10 +184,11 @@ async def test_gateway_uses_its_own_upstream_credential_never_the_clients_key(wo
 
 # -- operations ----------------------------------------------------------------------
 
-async def test_health_endpoints_need_no_key(world):
+@pytest.mark.parametrize("live, ready", [("/healthz", "/readyz"), ("/health", "/ready")])  # Kubernetes, Cloud Run
+async def test_health_endpoints_need_no_key(world, live, ready):
     async with httpx.AsyncClient() as h:
-        assert (await h.get(world.served.base + "/healthz")).json() == {"status": "ok"}
-        assert (await h.get(world.served.base + "/readyz")).json() == {"status": "ready"}
+        assert (await h.get(world.served.base + live)).json() == {"status": "ok"}
+        assert (await h.get(world.served.base + ready)).json() == {"status": "ready"}
 
 
 async def test_two_stateless_replicas_accept_the_same_key_and_see_revocation(world):
