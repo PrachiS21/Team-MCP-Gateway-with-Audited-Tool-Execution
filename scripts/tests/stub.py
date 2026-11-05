@@ -77,7 +77,8 @@ def gcloud(args):
     """Secrets are folders of numbered versions (secrets/<name>/<n>, plus <n>.destroyed once destroyed). Repositories,
     buckets, service accounts and Cloud Run services are files that exist or not; a deployed service's file holds its
     URL, and the YAML given with --env-vars-file is kept as vars/<service>.yaml. IAM bindings go to iam.txt and budget
-    names to budgets.txt, one per line."""
+    names to budgets.txt, one per line. Logs-based metrics keep their config (metrics/<name>.yaml), uptime checks their
+    command line (uptime/<name>), dashboards their JSON (dashboards/<n>.json)."""
     root = Path(os.environ["STUB_STATE"]) / "gcloud"
     root.mkdir(exist_ok=True)
     w = [a for a in args if not a.startswith("-")]  # the command words and positional arguments
@@ -122,6 +123,28 @@ def gcloud(args):
         elif w[2] == "create":
             with open(names, "a") as f:
                 f.write(opt(args, "display-name") + "\n")
+    elif w[:2] == ["logging", "metrics"] and w[2] in ("create", "update"):  # keep the file each metric was given
+        (root / "metrics").mkdir(exist_ok=True)
+        shutil.copy(opt(args, "config-from-file"), root / "metrics" / f"{w[3]}.yaml")
+    elif w[:3] == ["logging", "metrics", "describe"]:
+        return 0 if (root / "metrics" / f"{w[3]}.yaml").exists() else fail(f"NOT_FOUND: metric {w[3]}")
+    elif w[:3] == ["monitoring", "uptime", "list-configs"]:
+        names = sorted(p.name for p in (root / "uptime").iterdir()) if (root / "uptime").exists() else []
+        full = opt(args, "format") == "value(name)"
+        for name in names:
+            print(f"projects/{os.environ.get('STUB_GCP_PROJECT', 'demo-proj')}/uptimeCheckConfigs/{name}-id" if full else name)
+    elif w[:3] == ["monitoring", "uptime", "create"]:
+        (root / "uptime").mkdir(exist_ok=True)
+        (root / "uptime" / w[3]).write_text(" ".join(args))
+    elif w[:3] == ["monitoring", "uptime", "delete"]:
+        (root / "uptime" / w[3].removesuffix("-id")).unlink()
+    elif w[:3] == ["monitoring", "dashboards", "list"]:
+        for f in sorted((root / "dashboards").glob("*.json")) if (root / "dashboards").exists() else []:
+            print(json.loads(f.read_text())["displayName"])
+    elif w[:3] == ["monitoring", "dashboards", "create"]:
+        (root / "dashboards").mkdir(exist_ok=True)
+        config = Path(opt(args, "config-from-file")).read_text()
+        (root / "dashboards" / f"{len(list((root / 'dashboards').iterdir()))}.json").write_text(config)
     elif w[:2] == ["run", "deploy"]:
         (root / "services").mkdir(exist_ok=True)
         (root / "services" / w[2]).write_text(f"https://{w[2]}-abc123-uc.a.run.app")

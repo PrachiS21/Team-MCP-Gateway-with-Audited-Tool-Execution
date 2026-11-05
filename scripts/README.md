@@ -89,7 +89,8 @@ linked, because the free tiers still need one.
 export WOO_MCP_URL=https://woo-mcp.<tailnet>.ts.net/mcp
 scripts/gcp-secrets.sh    # once: asks for the Groq key and the HP's woo-mcp token (hidden)
 ADMIN_EMAIL=<you> scripts/gcp-deploy.sh   # build + deploy; run again after every change
-scripts/gcp-teardown.sh   # deletes the Cloud Run services; secrets and images are kept
+scripts/gcp-observability.sh   # metrics, the dashboard and an uptime check on /health (free; see 4.)
+scripts/gcp-teardown.sh   # deletes the Cloud Run services and the uptime check; secrets and images are kept
 ```
 
 | Script | Does | Safety |
@@ -97,7 +98,8 @@ scripts/gcp-teardown.sh   # deletes the Cloud Run services; secrets and images a
 | `tailscale-operator.sh` (HP) | Stores the Tailscale OAuth client as the Secret `tailscale/operator-oauth`, then installs Tailscale's operator | The secret never goes on a command line (Helm gets no credentials); an existing Secret is kept; local cluster only |
 | `gcp-secrets.sh` | 3 Secret Manager secrets: `gateway-env` (the gateway's secret key, admin key, LLM key and the ADK agent's key as one file, `GATEWAY_SECRETS_FILE`) and the two MCP tokens. With woo-mcp on Cloud Run: 5, adding the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value, such as a token still in base64, creates nothing |
 | `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys gst, then the gateway (its seed needs the URLs) | Checks every setting, billing and the secrets before changing anything |
-| `gcp-teardown.sh [--yes]` | Deletes the Cloud Run services | Asks for `delete` to be typed |
+| `gcp-observability.sh` | Creates four logs-based metrics (`deploy/gcp/observability/metrics/`), the "MCP gateway" dashboard and an uptime check on `/health` | Needs the gateway deployed; makes nothing twice; creates no alert policies (they are billed) |
+| `gcp-teardown.sh [--yes]` | Deletes the Cloud Run services and the uptime check | Asks for `delete` to be typed |
 
 **What publishing woo-mcp means:** it's the only thing reachable from the internet, and it refuses requests without its
 token. The Tailscale proxy is wired to woo-mcp alone, so no `Host` header can reach the storefront or the dashboard,
@@ -121,6 +123,28 @@ and GST, before you put the agent on a public website.
    - "delete product 12" is politely refused, because no tool that changes anything is offered.
 
    The calls show in the dashboard's audit page with source "cx".
+
+**4. Watching it.** `gcp-observability.sh` sets up:
+- **logs-based metrics:** tool calls by outcome, server, tool and source; latency; refused keys; CX turns;
+- **a dashboard** with those, plus Cloud Run's own request and instance charts;
+- **an uptime check** on `/health` every 15 minutes.
+
+All of it is free. There are no alert emails, because alert policies are billed per condition; the budget alert is the one notification. The metrics count log lines from the moment they exist, not earlier ones.
+
+The uptime check also keeps the gateway from idling long enough to stop, so its in-memory database rarely resets.
+
+For anything else, use Logs Explorer (Logging > Logs Explorer), or the same query with `gcloud logging read '<query>' --freshness=1h`:
+
+| To see | Query (add `resource.labels.service_name="gateway"` in front) |
+|---|---|
+| failed tool calls | `jsonPayload.event="tool_call" jsonPayload.outcome!="success"` |
+| refused API keys, and which key id | `jsonPayload.outcome="auth_failed"` |
+| one request's whole story | open any line > "Show entries for this trace" (every line carries its trace) |
+| CX conversations, by CX session id | `jsonPayload.event="cx_turn"` |
+| configuration changes (servers, users) | `jsonPayload.event="admin_event"` |
+| the latest lines | `gcloud run services logs read gateway --region=us-central1 --limit=50` |
+
+No line carries an API key, an email or a customer's words.
 
 **How it stays free:**
 - **Services:** no instance while idle, CPU only during requests, and a cap on instances.

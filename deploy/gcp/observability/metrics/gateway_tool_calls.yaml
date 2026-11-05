@@ -1,0 +1,21 @@
+# Every tool call the gateway finished, from any source (Claude Code over MCP, the dashboard chat, the CX webhook).
+# Counted from the one JSON line the gateway logs per call (event "tool_call", backend/src/gateway/audit/service.py).
+# Refused keys are counted apart, in gateway_auth_failures.
+description: Tool calls the gateway finished, by outcome, server, tool and source
+filter: >-
+  resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
+  AND jsonPayload.event="tool_call" AND jsonPayload.outcome!="auth_failed"
+labelExtractors:
+  outcome: EXTRACT(jsonPayload.outcome)
+  server: EXTRACT(jsonPayload.server)
+  tool: EXTRACT(jsonPayload.tool)
+  source: EXTRACT(jsonPayload.source)
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - {key: outcome, valueType: STRING, description: "success, tool_error, error or denied"}
+    - {key: server, valueType: STRING, description: "the upstream server's slug"}
+    - {key: tool, valueType: STRING, description: "the tool's name on its server"}
+    - {key: source, valueType: STRING, description: "mcp, chat or cx"}

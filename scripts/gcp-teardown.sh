@@ -1,7 +1,8 @@
 #!/bin/sh
-# Deletes the Cloud Run services made by gcp-deploy.sh (gateway, woo-mcp, gst). Kept: the secrets, the images, the
-# service accounts and the budget alert. None of them costs anything inside the free tiers, and keeping the secrets
-# means a redeploy brings back the same keys. It asks first; --yes skips the question.
+# Deletes the Cloud Run services made by gcp-deploy.sh (gateway, woo-mcp, gst), and the uptime check of
+# gcp-observability.sh, which would only report failures without them. Kept: the secrets, the images, the service
+# accounts, the budget alert, the metrics and the dashboard. None of them costs anything inside the free tiers, and
+# keeping the secrets means a redeploy brings back the same keys. It asks first; --yes skips the question.
 set -eu
 . "$(dirname "$0")/lib.sh"
 . "$(dirname "$0")/gcp-lib.sh"
@@ -30,4 +31,10 @@ for service in gateway woo-mcp gst; do
     log "$service not found (fine)"
   fi
 done
-log "kept: the secrets, images, service accounts and budget alert (delete them in the console if you want them gone)"
+checks="$(gcloud monitoring uptime list-configs --project="$PROJECT" --filter='displayName="gateway-health"' \
+  --format='value(name)' 2>/dev/null || true)"
+for check in $checks; do
+  gcloud monitoring uptime delete "${check##*/}" --project="$PROJECT" --quiet >/dev/null
+  log "deleted the uptime check gateway-health"
+done
+log "kept: the secrets, images, service accounts, budget alert, metrics and dashboard (delete them in the console if you want them gone)"

@@ -809,3 +809,126 @@ def test_gcp_deploy_passes_a_cx_allowlist_and_needs_the_cx_key_too(env):
 
 def gateway_env_lines(env):
     return gcp_secret(env, "gateway-env").splitlines()
+
+
+# -- gcp-observability.sh: logs-based metrics, a dashboard and an uptime check; no alert policies -------------------
+
+OBS = GCP / "observability"
+METRICS = sorted(p.stem for p in (OBS / "metrics").glob("*.yaml"))
+
+
+def deployed(env):
+    hp_ready(env)
+    assert env.run("gcp-deploy.sh", **WOO_ON_HP).returncode == 0
+    env.log.write_text("")
+
+
+def test_observability_creates_the_free_parts_once_and_never_an_alert(env):
+    deployed(env)
+    r = env.run("gcp-observability.sh")
+    assert r.returncode == 0, r.stderr
+    assert sorted(p.stem for p in (env.state / "gcloud" / "metrics").glob("*.yaml")) == METRICS == [
+        "gateway_auth_failures", "gateway_cx_turns", "gateway_tool_calls", "gateway_tool_latency"]
+    for name in METRICS:  # each made from its own file
+        assert (env.state / "gcloud" / "metrics" / f"{name}.yaml").read_text() == (OBS / "metrics" / f"{name}.yaml").read_text()
+    check = (env.state / "gcloud" / "uptime" / "gateway-health").read_text()
+    for part in ("--resource-labels=host=gateway-abc123-uc.a.run.app,project_id=demo-proj", "--protocol=https",
+                 "--path=/health", "--period=15"):
+        assert part in check, part
+    [dashboard] = (env.state / "gcloud" / "dashboards").glob("*.json")
+    assert json.loads(dashboard.read_text())["displayName"] == "MCP gateway"
+    assert not [c for c in env.calls("gcloud") if " policies " in c or " channels " in c]  # alerts are billed: none
+
+    env.log.write_text("")
+    r = env.run("gcp-observability.sh")  # again: metrics updated from their files, nothing made twice
+    assert r.returncode == 0, r.stderr
+    assert len(gcloud_calls(env, "logging metrics update")) == 4 and not gcloud_calls(env, "logging metrics create")
+    assert not gcloud_calls(env, "monitoring uptime create") and not gcloud_calls(env, "monitoring dashboards create")
+    assert len(list((env.state / "gcloud" / "dashboards").glob("*.json"))) == 1
+
+
+def test_observability_needs_a_deployed_gateway(env):
+    r = env.run("gcp-observability.sh")
+    assert r.returncode != 0 and "gcp-deploy.sh" in r.stderr
+    assert not gcloud_calls(env, "logging metrics") and not gcloud_calls(env, "monitoring uptime create")
+
+
+def test_teardown_also_removes_the_uptime_check_and_keeps_metrics_and_dashboard(env):
+    deployed(env)
+    assert env.run("gcp-observability.sh").returncode == 0
+    r = env.run("gcp-teardown.sh", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert "gcloud monitoring uptime delete gateway-health-id --project=demo-proj --quiet" in env.calls()
+    assert not (env.state / "gcloud" / "uptime" / "gateway-health").exists()
+    assert len(list((env.state / "gcloud" / "metrics").glob("*.yaml"))) == 4  # free to keep
+    assert not [c for c in env.calls("gcloud") if "metrics delete" in c or "dashboards delete" in c]
+
+
+def test_every_metric_is_well_formed_and_reads_only_the_gateways_own_log_lines():
+    for name in METRICS:
+        m = yaml.safe_load((OBS / "metrics" / f"{name}.yaml").read_text())
+        assert 'resource.labels.service_name="gateway"' in m["filter"], name  # never another service's logs
+        # a label the extractors fill must be declared, and the reverse: the API refuses a mismatch
+        assert set(m["labelExtractors"]) == {l["key"] for l in m["metricDescriptor"]["labels"]}, name
+        is_distribution = m["metricDescriptor"]["valueType"] == "DISTRIBUTION"
+        assert is_distribution == ("valueExtractor" in m) == ("bucketOptions" in m), name
+
+
+def gateway_log_lines(tmp_path) -> dict:
+    """One tool_call line and one cx_turn line, written by the gateway's own code through its JSON formatter."""
+    import asyncio
+    import logging
+    from gateway.audit.service import AuditLog
+    from gateway.cx import CxWebhook
+    from gateway.logs import JsonFormatter
+    from gateway.service import Caller
+
+    lines = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            lines.append(json.loads(JsonFormatter().format(record)))
+
+    handler = Keep(level=logging.INFO)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    old_level, root.level = root.level, logging.INFO
+    try:
+        AuditLog(f"sqlite:///{tmp_path / 'audit.db'}").record(
+            outcome="success", source="mcp", user_id="u1", key_id="ab12cd34", server_slug="woo", tool="list_orders",
+            duration_ms=12)
+        asyncio.run(CxWebhook(None, 1).handle(Caller("u2", "cx@example.com", "cd34ef56", "cx"),
+                                              {"text": "hi", "sessionInfo": {"session": "a/sessions/s1"}}))
+    finally:
+        root.removeHandler(handler)
+        root.level = old_level
+    return {line["event"]: line for line in lines if "event" in line}
+
+
+def test_every_log_field_a_metric_reads_is_one_the_gateway_really_logs(tmp_path):
+    """Rename a field in the gateway's log lines and this fails, instead of a metric silently counting nothing."""
+    lines = gateway_log_lines(tmp_path)
+    assert set(lines) == {"tool_call", "cx_turn"}
+    for name in METRICS:
+        text = (OBS / "metrics" / f"{name}.yaml").read_text()
+        event = re.search(r'jsonPayload\.event="([a-z_]+)"', text).group(1)
+        for field in set(re.findall(r"jsonPayload\.([a-z_]+)", text)):
+            assert field in lines[event], (name, field)
+
+
+def test_the_dashboard_charts_our_metrics_and_fits_its_grid():
+    board = json.loads((OBS / "dashboard.json").read_text())
+    tiles = board["mosaicLayout"]["tiles"]
+    used = {m for t in tiles for ds in t["widget"]["xyChart"]["dataSets"]
+            for m in re.findall(r'metric\.type="([^"]+)"', ds["timeSeriesQuery"]["timeSeriesFilter"]["filter"])}
+    ours = {m.removeprefix("logging.googleapis.com/user/") for m in used if m.startswith("logging.googleapis.com/user/")}
+    assert ours == set(METRICS)  # every metric is charted, and no chart names one that does not exist
+    assert used - {f"logging.googleapis.com/user/{m}" for m in METRICS} == {
+        "monitoring.googleapis.com/uptime_check/check_passed", "run.googleapis.com/request_count",
+        "run.googleapis.com/container/instance_count"}  # built-in metrics
+    cells = set()
+    for t in tiles:
+        assert t["widget"]["title"] and 0 <= t["xPos"] and t["xPos"] + t["width"] <= 48
+        area = {(x, y) for x in range(t["xPos"], t["xPos"] + t["width"]) for y in range(t["yPos"], t["yPos"] + t["height"])}
+        assert not cells & area  # no two charts on top of each other
+        cells |= area
