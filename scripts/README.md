@@ -95,7 +95,7 @@ scripts/gcp-teardown.sh   # deletes the Cloud Run services; secrets and images a
 | Script | Does | Safety |
 |---|---|---|
 | `tailscale-operator.sh` (HP) | Stores the Tailscale OAuth client as the Secret `tailscale/operator-oauth`, then installs Tailscale's operator | The secret never goes on a command line (Helm gets no credentials); an existing Secret is kept; local cluster only |
-| `gcp-secrets.sh` | 3 Secret Manager secrets: `gateway-env` (the gateway's secret key, admin key and LLM key as one file, `GATEWAY_SECRETS_FILE`) and the two MCP tokens. With woo-mcp on Cloud Run: 5, adding the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value, such as a token still in base64, creates nothing |
+| `gcp-secrets.sh` | 3 Secret Manager secrets: `gateway-env` (the gateway's secret key, admin key, LLM key and the ADK agent's key as one file, `GATEWAY_SECRETS_FILE`) and the two MCP tokens. With woo-mcp on Cloud Run: 5, adding the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value, such as a token still in base64, creates nothing |
 | `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys gst, then the gateway (its seed needs the URLs) | Checks every setting, billing and the secrets before changing anything |
 | `gcp-teardown.sh [--yes]` | Deletes the Cloud Run services | Asks for `delete` to be typed |
 

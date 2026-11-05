@@ -437,9 +437,10 @@ def test_gcp_secrets_makes_five_values_in_one_region_in_the_shapes_the_services_
     r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{CK}\n{CS}\n")
     assert r.returncode == 0, r.stderr
     gw = gateway_env(env)
-    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY"}
+    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY", "ADK_AGENT_KEY"}
     Fernet(gw["GATEWAY_SECRET_KEY"].encode())  # raises if it is not a valid key for the gateway's encryption
     assert parse_key(gw["GATEWAY_ADMIN_KEY"]) is not None and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY
+    assert parse_key(gw["ADK_AGENT_KEY"]) is not None and gw["ADK_AGENT_KEY"] != gw["GATEWAY_ADMIN_KEY"]
     woo, gst = gcp_secret(env, "woo-mcp-token"), gcp_secret(env, "gst-mcp-token")
     assert re.fullmatch(r"[0-9a-f]{48}", woo) and re.fullmatch(r"[0-9a-f]{48}", gst) and woo != gst  # no "\n" at the end
     assert gcp_secret(env, "woo-consumer-key") == CK and gcp_secret(env, "woo-consumer-secret") == CS
@@ -538,6 +539,9 @@ def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env
     entries = load_seed(gw["GATEWAY_SEED_JSON"], {"WOO_MCP_TOKEN": "t1", "GST_MCP_TOKEN": "t2"})  # the gateway's loader
     assert [(e.slug, e.url, e.credential) for e in entries] == [
         ("woo", "https://woo-mcp-abc123-uc.a.run.app/mcp", "t1"), ("gst", "https://gst-abc123-uc.a.run.app/mcp", "t2")]
+    # the ADK agent's member user, seeded so its key survives the database being wiped (the key stays in gateway-env)
+    assert json.loads(gw["GATEWAY_SEED_JSON"])["users"] == [
+        {"email": "adk-agent@example.com", "role": "member", "key_env": "ADK_AGENT_KEY"}]
     seen = text + env.log.read_text() + r.stdout + r.stderr
     for value in every_gcp_secret_value(env):
         assert value not in seen
@@ -746,3 +750,35 @@ def test_tailscale_operator_refuses_without_storing_or_installing_anything(env, 
     assert env.secret("tailscale", "operator-oauth") is None
     assert not [c for c in env.calls("helm") if "upgrade" in c]
     assert "not-a-client-secret" not in r.stdout + r.stderr
+
+
+# -- the ADK agent's key (adk-agent/) in gateway-env -----------------------------------------------------------
+
+def old_gateway_env(env, text):
+    """A gateway-env made before the ADK agent existed: version 1, no ADK_AGENT_KEY."""
+    folder = env.state / "gcloud" / "secrets" / "gateway-env"
+    folder.mkdir(parents=True)
+    (folder / "1").write_text(text)
+
+
+def test_an_older_gateway_env_gets_the_agents_key_and_keeps_everything_else(env):
+    old = f"GATEWAY_SECRET_KEY=keep-me\nGATEWAY_ADMIN_KEY=wmcp_0123abcd_{'e' * 64}\nGATEWAY_LLM_API_KEY={LLM_KEY}\n"
+    old_gateway_env(env, old)
+    r = env.run("gcp-secrets.sh", stdin=f"{HP_TOKEN}\n", WOO_MCP_URL=WOO_ON_HP["WOO_MCP_URL"])
+    assert r.returncode == 0, r.stderr
+    gw = gateway_env(env)
+    assert gw["GATEWAY_SECRET_KEY"] == "keep-me" and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY  # nothing else changed
+    assert parse_key(gw["ADK_AGENT_KEY"]) is not None
+    assert gcp_versions(env, "gateway-env") == ([2], [1])  # one billed version
+    assert "added ADK_AGENT_KEY to gateway-env" in r.stdout and gw["ADK_AGENT_KEY"] not in r.stdout + r.stderr
+
+
+def test_gcp_deploy_will_not_seed_an_agent_whose_key_is_missing(env):
+    """The seed names ADK_AGENT_KEY: a gateway-env without it would make the gateway refuse to start."""
+    old_gateway_env(env, f"GATEWAY_SECRET_KEY=k\nGATEWAY_ADMIN_KEY=wmcp_0123abcd_{'e' * 64}\n")
+    for name in ("woo-mcp-token", "gst-mcp-token"):
+        (env.state / "gcloud" / "secrets" / name).mkdir(parents=True)
+        (env.state / "gcloud" / "secrets" / name / "1").write_text("ab" * 24)
+    r = env.run("gcp-deploy.sh", **WOO_ON_HP)
+    assert r.returncode != 0 and "ADK_AGENT_KEY" in r.stderr and "gcp-secrets.sh" in r.stderr
+    assert not gcloud_calls(env, "builds submit") and not gcloud_calls(env, "run deploy")

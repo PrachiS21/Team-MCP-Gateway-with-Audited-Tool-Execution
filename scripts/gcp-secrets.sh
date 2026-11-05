@@ -4,7 +4,8 @@
 # temporary files: never on a command line, never printed. Safe to run again: a secret that exists is never replaced.
 #
 #   gateway-env          the gateway's own secrets as NAME=value lines, mounted as ONE file (GATEWAY_SECRETS_FILE):
-#                        GATEWAY_SECRET_KEY, GATEWAY_ADMIN_KEY, GATEWAY_LLM_API_KEY (the Groq key; optional)
+#                        GATEWAY_SECRET_KEY, GATEWAY_ADMIN_KEY, GATEWAY_LLM_API_KEY (the Groq key; optional), and
+#                        ADK_AGENT_KEY (the ADK agent's member key; gcp-deploy.sh seeds its user, see adk-agent/)
 #   woo-mcp-token        the token woo-mcp accepts; the gateway gets it as WOO_MCP_TOKEN
 #   gst-mcp-token        gst's MCP_SERVER_TOKEN; the gateway gets it as GST_MCP_TOKEN
 # and, only when woo-mcp runs on Cloud Run:
@@ -21,7 +22,7 @@
 # skipped at first, say) goes into a NEW version that also holds the old values; the older versions are then
 # destroyed. Destroying cannot be undone, which is fine: the new version holds everything they did.
 #
-# Read the admin key when you need it (this script never prints it):
+# Read a key when you need it (this script never prints one): the admin's, or the ADK agent's with ADK_AGENT_KEY
 #   gcloud secrets versions access latest --secret=gateway-env | sed -n 's/^GATEWAY_ADMIN_KEY=//p'
 set -eu
 . "$(dirname "$0")/lib.sh"
@@ -73,14 +74,20 @@ else
   } > "$WORK/gateway.env"
   GATEWAY_ENV=new
 fi
+ADDED=""  # values added to an existing gateway-env
 if ! grep -q '^GATEWAY_LLM_API_KEY=' "$WORK/gateway.env"; then
   llm="$(ask 'Groq API key for the chat agent (Enter to skip: the chat stays off until you run this again)')"
   if [ -n "$llm" ]; then
     looks_like "an API key" "$llm" '[A-Za-z0-9_.-]{8,}'
     printf 'GATEWAY_LLM_API_KEY=%s\n' "$llm" >> "$WORK/gateway.env"
-    if [ "$GATEWAY_ENV" = kept ]; then GATEWAY_ENV=changed; fi
+    ADDED="$ADDED GATEWAY_LLM_API_KEY"
   fi
 fi
+if ! grep -q '^ADK_AGENT_KEY=' "$WORK/gateway.env"; then  # also added to a gateway-env made before the ADK agent
+  printf 'ADK_AGENT_KEY=wmcp_%s_%s\n' "$(hex 4)" "$(hex 32)" >> "$WORK/gateway.env"
+  ADDED="$ADDED ADK_AGENT_KEY"
+fi
+if [ "$GATEWAY_ENV" = kept ] && [ -n "$ADDED" ]; then GATEWAY_ENV=changed; fi
 if [ -n "$WOO_MCP_URL" ]; then
   if secret_exists woo-mcp-token; then
     log "note: woo-mcp-token is kept as it is, and must match the token the HP's woo-mcp has"
@@ -108,7 +115,7 @@ case "$GATEWAY_ENV" in
   new) create gateway-env "$WORK/gateway.env" ;;
   changed)
     gcloud secrets versions add gateway-env --project="$PROJECT" --data-file="$WORK/gateway.env" >/dev/null
-    log "added GATEWAY_LLM_API_KEY to gateway-env; the gateway reads it at its next start"
+    log "added$ADDED to gateway-env; the gateway reads it at its next start"
     destroy_older_versions gateway-env ;;
   *) log "gateway-env already exists; leaving it alone" ;;
 esac
