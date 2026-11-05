@@ -21,10 +21,11 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import httpx
 
+from gateway.mcp.manager import NamespacedTool
 from gateway.service import Caller, GatewayResult, GatewayService
 
 log = logging.getLogger("gateway")
@@ -160,15 +161,22 @@ def validate_history(raw: Any) -> list[dict]:
 
 
 class ChatAgent:
+    """`tool_filter` narrows the tools offered (the CX webhook offers read-only ones only); a tool that is not offered
+    is never called. `system_prompt` must contain {now}."""
+
     def __init__(self, service: GatewayService, llm: LLM, *, max_steps: int = MAX_STEPS,
-                 max_tool_calls: int = MAX_TOOL_CALLS, total_timeout: float = 180.0):
+                 max_tool_calls: int = MAX_TOOL_CALLS, total_timeout: float = 180.0,
+                 tool_filter: Callable[[NamespacedTool], bool] | None = None, system_prompt: str = SYSTEM_PROMPT):
         self.service, self.llm = service, llm
         self.max_steps, self.max_tool_calls, self.total_timeout = max_steps, max_tool_calls, total_timeout
+        self.tool_filter, self.system_prompt = tool_filter, system_prompt
 
     async def _tools(self, caller: Caller) -> list[dict]:
         catalogue = await self.service.list_tools(caller)
         tools = []
         for t in catalogue.tools:
+            if self.tool_filter is not None and not self.tool_filter(t):
+                continue
             if not _TOOL_NAME.match(t.name):
                 log.warning("tool %r not offered to the chat: its name is not a valid function name", t.name)
                 continue
@@ -192,7 +200,7 @@ class ChatAgent:
         tools = await self._tools(caller)
         offered = {t["function"]["name"] for t in tools}
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT.format(now=now)}, *conversation]
+        messages: list[dict] = [{"role": "system", "content": self.system_prompt.format(now=now)}, *conversation]
         records: list[ToolCallRecord] = []
 
         for _ in range(self.max_steps):

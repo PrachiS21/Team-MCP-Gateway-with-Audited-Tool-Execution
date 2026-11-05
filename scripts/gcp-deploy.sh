@@ -14,8 +14,9 @@
 #
 #   WOO_MCP_URL=https://woo-mcp.<tailnet>.ts.net/mcp ADMIN_EMAIL=you@example.com scripts/gcp-deploy.sh
 #
-# Other settings: ADMIN_EMAIL (required); ADK_AGENT_EMAIL (the ADK agent's user, default adk-agent@example.com:
-# a member whose key is ADK_AGENT_KEY in gateway-env); LLM_MODEL (default openai/gpt-oss-120b, as values-local.yaml);
+# Other settings: ADMIN_EMAIL (required); ADK_AGENT_EMAIL and CX_AGENT_EMAIL (the members whose keys are ADK_AGENT_KEY
+# and CX_AGENT_KEY in gateway-env; default adk-agent@ / cx-agent@example.com); CX_TOOLS (optional: the tools the
+# CX webhook may use, comma-separated <server>__<tool>; read-only ones only, whatever is listed); LLM_MODEL (default openai/gpt-oss-120b, as values-local.yaml);
 # STORE_TIMEZONE (default Asia/Kolkata); STORE_STATE (gst's home state, default MH); BUDGET (alert amount in the
 # billing account's currency, default 1); GCP_PROJECT, GCP_REGION, GCP_REPO (gcp-lib.sh); GCP_TAG (image tag).
 #
@@ -34,6 +35,8 @@ PROJECT="$(gcp_project)"
 WOO_BASE_URL="${WOO_BASE_URL:-}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-}"
 ADK_AGENT_EMAIL="${ADK_AGENT_EMAIL:-adk-agent@example.com}"
+CX_AGENT_EMAIL="${CX_AGENT_EMAIL:-cx-agent@example.com}"
+CX_TOOLS="${CX_TOOLS:-}"
 LLM_MODEL="${LLM_MODEL:-openai/gpt-oss-120b}"
 STORE_TIMEZONE="${STORE_TIMEZONE:-Asia/Kolkata}"
 STORE_STATE="${STORE_STATE:-MH}"
@@ -63,6 +66,8 @@ fi
 [ -n "$ADMIN_EMAIL" ] || die "set ADMIN_EMAIL to the first admin's email (their key is GATEWAY_ADMIN_KEY in gateway-env)"
 valid ADMIN_EMAIL "$ADMIN_EMAIL" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+'
 valid ADK_AGENT_EMAIL "$ADK_AGENT_EMAIL" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+'
+valid CX_AGENT_EMAIL "$CX_AGENT_EMAIL" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+'
+valid CX_TOOLS "$CX_TOOLS" '([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?'
 valid LLM_MODEL "$LLM_MODEL" '[A-Za-z0-9._/:-]+'
 valid STORE_TIMEZONE "$STORE_TIMEZONE" '[A-Za-z0-9_/+-]+'
 valid STORE_STATE "$STORE_STATE" '[A-Z]{2}'
@@ -92,9 +97,11 @@ if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then NEEDED="$NEEDED $GCP_STORE_SECRETS"; fi
 for s in $NEEDED; do
   secret_exists "$s" || die "secret $s does not exist: run scripts/gcp-secrets.sh first (with the same WOO_MCP_URL)"
 done
-# The seed below names ADK_AGENT_KEY; without it the gateway would refuse to start. The value goes straight into grep.
-gcloud secrets versions access latest --secret=gateway-env --project="$PROJECT" | grep -q '^ADK_AGENT_KEY=' \
-  || die "gateway-env has no ADK_AGENT_KEY yet: run scripts/gcp-secrets.sh again (it adds it and keeps the rest)"
+# The seed below names these keys; without one the gateway would refuse to start. The values go straight into grep.
+for name in ADK_AGENT_KEY CX_AGENT_KEY; do
+  gcloud secrets versions access latest --secret=gateway-env --project="$PROJECT" | grep -q "^$name=" \
+    || die "gateway-env has no $name yet: run scripts/gcp-secrets.sh again (it adds it and keeps the rest)"
+done
 
 # A budget alert: billing admins get an email at 50% and 100% of BUDGET. It only WARNS, it never stops spending;
 # with the default of 1 (in the billing account's currency) any real charge sets it off. Needs the Billing Account
@@ -197,13 +204,14 @@ deploy gst gst-mcp --max-instances=2 --timeout=60 \
 GST_URL="$(url_of gst)"
 valid "gst's URL" "$GST_URL" 'https://[a-z0-9.-]+'
 
-# The seed names the two servers (woo-mcp where it runs, gst at its Cloud Run URL) and the ADK agent's member user,
-# whose key must survive the database being wiped when the gateway idles. It holds no secrets (the gateway refuses a
+# The seed names the two servers (woo-mcp where it runs, gst at its Cloud Run URL) and the member users of the ADK
+# agent and the CX webhook, whose keys must survive the database being wiped when the gateway idles. It holds no secrets (the gateway refuses a
 # seed that does), only the names of the variables holding them, so it can be plain config.
 server() { printf '{"slug": "%s", "name": "%s", "url": "%s", "credential_type": "bearer", "credential_env": "%s"}' "$@"; }
-SEED="$(printf '{"servers": [%s, %s], "users": [{"email": "%s", "role": "member", "key_env": "ADK_AGENT_KEY"}]}' \
+member() { printf '{"email": "%s", "role": "member", "key_env": "%s"}' "$@"; }
+SEED="$(printf '{"servers": [%s, %s], "users": [%s, %s]}' \
   "$(server woo 'WooCommerce (main)' "$WOO_MCP_URL" WOO_MCP_TOKEN)" "$(server gst 'GST calculator' "$GST_URL/mcp" GST_MCP_TOKEN)" \
-  "$ADK_AGENT_EMAIL")"
+  "$(member "$ADK_AGENT_EMAIL" ADK_AGENT_KEY)" "$(member "$CX_AGENT_EMAIL" CX_AGENT_KEY)")"
 
 # A YAML file rather than --set-env-vars, whose commas would split the JSON. Every value was checked above and none
 # can hold a single quote, so single-quoted YAML is safe.
@@ -215,7 +223,9 @@ GATEWAY_LLM_MODEL: '$LLM_MODEL'
 GATEWAY_LOG_FORMAT: json
 GATEWAY_GCP_PROJECT: '$PROJECT'
 GATEWAY_COOKIE_SECURE: '1'
+GATEWAY_CX_ENABLED: '1'
 EOF
+if [ -n "$CX_TOOLS" ]; then printf "GATEWAY_CX_TOOLS: '%s'\n" "$CX_TOOLS" >> "$WORK/gateway-vars.yaml"; fi
 
 # The gateway: at most ONE instance. Each instance has its own in-memory database, so a second one would be a second,
 # different database (log in on one, look logged out on the next request). gateway-env is mounted as a file, the two
@@ -230,5 +240,6 @@ GW_URL="$(url_of gateway)"
 
 log "done. Gateway: $GW_URL   (MCP endpoint $GW_URL/mcp, health $GW_URL/health); woo-mcp: $WOO_MCP_URL"
 log "the admin key, when you need it: gcloud secrets versions access latest --secret=gateway-env --project=$PROJECT | sed -n 's/^GATEWAY_ADMIN_KEY=//p'"
+log "Dialogflow CX webhook: $GW_URL/api/cx/webhook with the header Authorization: Bearer <CX_AGENT_KEY> (read it the same way)"
 log "Claude Code: claude mcp add --transport http gateway $GW_URL/mcp --header \"Authorization: Bearer <the admin key>\""
 log "after an idle spell the first request takes a few seconds: the services start from zero"

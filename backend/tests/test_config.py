@@ -115,3 +115,35 @@ def test_the_seed_can_come_as_text_but_not_from_two_places_at_once(monkeypatch):
     monkeypatch.setenv("GATEWAY_SEED_FILE", "/config/seed.json")
     with pytest.raises(SystemExit, match="not both"):
         Settings.from_env()
+
+
+# -- the Dialogflow CX webhook ------------------------------------------------------------------------------------
+
+def test_cx_is_off_by_default_and_its_settings_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("GATEWAY_SECRET_KEY", "test-key")
+    for name in ("GATEWAY_CX_ENABLED", "GATEWAY_CX_TIMEOUT", "GATEWAY_CX_HISTORY_TURNS", "GATEWAY_CX_TOOLS"):
+        monkeypatch.delenv(name, raising=False)
+    s = Settings.from_env()
+    assert (s.cx_enabled, s.cx_timeout, s.cx_history_turns, s.cx_tools) == (False, 25.0, 6, ())
+    monkeypatch.setenv("GATEWAY_CX_ENABLED", "1")
+    monkeypatch.setenv("GATEWAY_CX_TIMEOUT", "20")
+    monkeypatch.setenv("GATEWAY_CX_HISTORY_TURNS", "0")
+    monkeypatch.setenv("GATEWAY_CX_TOOLS", " woo__list_products, gst__calculate_gst ,")
+    s = Settings.from_env()
+    assert (s.cx_enabled, s.cx_timeout, s.cx_history_turns) == (True, 20.0, 0)
+    assert s.cx_tools == ("woo__list_products", "gst__calculate_gst")
+
+
+@pytest.mark.parametrize("name, value, says", [
+    ("GATEWAY_CX_TIMEOUT", "30", "under 30 seconds"),  # Dialogflow CX gives up at 30
+    ("GATEWAY_CX_TIMEOUT", "0.5", "at least 1"),
+    ("GATEWAY_CX_TIMEOUT", "soon", "must be a number"),
+    ("GATEWAY_CX_HISTORY_TURNS", "11", "between 0 and 10"),
+    ("GATEWAY_CX_HISTORY_TURNS", "2.5", "whole number"),
+    ("GATEWAY_CX_TOOLS", "woo__list products", "not a tool name"),
+])
+def test_a_bad_cx_setting_stops_the_gateway_with_a_clear_message(monkeypatch, name, value, says):
+    monkeypatch.setenv("GATEWAY_SECRET_KEY", "test-key")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit, match=says):
+        Settings.from_env()

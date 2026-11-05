@@ -53,7 +53,7 @@ class Caller:
     user_id: str
     email: str
     key_id: str | None = None  # public id of the API key used, if any
-    source: str = "mcp"  # "mcp" | "chat"
+    source: str = "mcp"  # "mcp" | "chat" | "cx"
 
     @classmethod
     def from_user(cls, user: User, key_id: str | None = None, source: str = "mcp") -> "Caller":

@@ -21,7 +21,7 @@ _log = logging.getLogger("gateway.audit")
 
 OUTCOMES = ("started", "success", "tool_error", "error", "auth_failed", "denied")
 # "started" is the write-ahead row; a row that stays "started" means the process died mid-call.
-SOURCES = ("mcp", "chat", "api")  # api = dashboard login attempts
+SOURCES = ("mcp", "chat", "api", "cx")  # api = dashboard login attempts; cx = the Dialogflow CX webhook
 MAX_PAGE = 500
 
 

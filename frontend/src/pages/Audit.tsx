@@ -26,7 +26,7 @@ export function Audit({ user, onUnauthorized }: PageProps & { user: User }) {
   return (
     <section>
       <h2>Audit log</h2>
-      <p className="hint">{admin ? "Every tool call by everyone." : "Your own tool calls."} Calls from the chat show source "chat".</p>
+      <p className="hint">{admin ? "Every tool call by everyone." : "Your own tool calls."} Calls from the chat show source "chat"; from the Dialogflow CX webhook, "cx".</p>
       <div className="row card">
         {admin && <input placeholder="user email" value={filter.user} onChange={set("user")} />}
         <input placeholder="server slug" value={filter.server} onChange={set("server")} />

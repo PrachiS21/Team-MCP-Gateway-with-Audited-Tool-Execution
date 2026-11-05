@@ -437,10 +437,11 @@ def test_gcp_secrets_makes_five_values_in_one_region_in_the_shapes_the_services_
     r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{CK}\n{CS}\n")
     assert r.returncode == 0, r.stderr
     gw = gateway_env(env)
-    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY", "ADK_AGENT_KEY"}
+    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY", "ADK_AGENT_KEY", "CX_AGENT_KEY"}
     Fernet(gw["GATEWAY_SECRET_KEY"].encode())  # raises if it is not a valid key for the gateway's encryption
     assert parse_key(gw["GATEWAY_ADMIN_KEY"]) is not None and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY
-    assert parse_key(gw["ADK_AGENT_KEY"]) is not None and gw["ADK_AGENT_KEY"] != gw["GATEWAY_ADMIN_KEY"]
+    keys = [gw[k] for k in ("GATEWAY_ADMIN_KEY", "ADK_AGENT_KEY", "CX_AGENT_KEY")]
+    assert all(parse_key(k) for k in keys) and len(set(keys)) == 3  # every user its own key
     woo, gst = gcp_secret(env, "woo-mcp-token"), gcp_secret(env, "gst-mcp-token")
     assert re.fullmatch(r"[0-9a-f]{48}", woo) and re.fullmatch(r"[0-9a-f]{48}", gst) and woo != gst  # no "\n" at the end
     assert gcp_secret(env, "woo-consumer-key") == CK and gcp_secret(env, "woo-consumer-secret") == CS
@@ -541,7 +542,9 @@ def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env
         ("woo", "https://woo-mcp-abc123-uc.a.run.app/mcp", "t1"), ("gst", "https://gst-abc123-uc.a.run.app/mcp", "t2")]
     # the ADK agent's member user, seeded so its key survives the database being wiped (the key stays in gateway-env)
     assert json.loads(gw["GATEWAY_SEED_JSON"])["users"] == [
-        {"email": "adk-agent@example.com", "role": "member", "key_env": "ADK_AGENT_KEY"}]
+        {"email": "adk-agent@example.com", "role": "member", "key_env": "ADK_AGENT_KEY"},
+        {"email": "cx-agent@example.com", "role": "member", "key_env": "CX_AGENT_KEY"}]
+    assert gw["GATEWAY_CX_ENABLED"] == "1" and "GATEWAY_CX_TOOLS" not in gw  # no allowlist: every read-only tool
     seen = text + env.log.read_text() + r.stdout + r.stderr
     for value in every_gcp_secret_value(env):
         assert value not in seen
@@ -679,6 +682,7 @@ def test_gcp_deploy_marks_images_built_from_uncommitted_changes(env):
     ({"ADMIN_EMAIL": "x'@example.com"}, "ADMIN_EMAIL"),
     ({"LLM_MODEL": "a,b"}, "LLM_MODEL"),
     ({"GCP_TAG": "-bad tag"}, "GCP_TAG"),
+    ({"CX_TOOLS": "woo__x,EVIL=1"}, "CX_TOOLS"),
     ({"STUB_BILLING_ACCOUNT": ""}, "no billing account"),
 ])
 def test_gcp_deploy_stops_before_changing_anything_when_a_setting_is_wrong(env, change, says):
@@ -770,7 +774,9 @@ def test_an_older_gateway_env_gets_the_agents_key_and_keeps_everything_else(env)
     assert gw["GATEWAY_SECRET_KEY"] == "keep-me" and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY  # nothing else changed
     assert parse_key(gw["ADK_AGENT_KEY"]) is not None
     assert gcp_versions(env, "gateway-env") == ([2], [1])  # one billed version
-    assert "added ADK_AGENT_KEY to gateway-env" in r.stdout and gw["ADK_AGENT_KEY"] not in r.stdout + r.stderr
+    assert parse_key(gw["CX_AGENT_KEY"]) is not None
+    assert "added ADK_AGENT_KEY CX_AGENT_KEY to gateway-env" in r.stdout
+    assert gw["ADK_AGENT_KEY"] not in r.stdout + r.stderr and gw["CX_AGENT_KEY"] not in r.stdout + r.stderr
 
 
 def test_gcp_deploy_will_not_seed_an_agent_whose_key_is_missing(env):
@@ -782,3 +788,24 @@ def test_gcp_deploy_will_not_seed_an_agent_whose_key_is_missing(env):
     r = env.run("gcp-deploy.sh", **WOO_ON_HP)
     assert r.returncode != 0 and "ADK_AGENT_KEY" in r.stderr and "gcp-secrets.sh" in r.stderr
     assert not gcloud_calls(env, "builds submit") and not gcloud_calls(env, "run deploy")
+
+
+def test_gcp_deploy_passes_a_cx_allowlist_and_needs_the_cx_key_too(env):
+    hp_ready(env)
+    r = env.run("gcp-deploy.sh", CX_TOOLS="woo__list_products,gst__calculate_gst", **WOO_ON_HP)
+    assert r.returncode == 0, r.stderr
+    gw = yaml.safe_load((env.state / "gcloud" / "vars" / "gateway.yaml").read_text())
+    assert gw["GATEWAY_CX_TOOLS"] == "woo__list_products,gst__calculate_gst"
+    assert "/api/cx/webhook" in r.stdout
+    # a gateway-env with the ADK key but not the CX key: the seed would name a missing key, so nothing is deployed
+    env.log.write_text("")
+    folder = env.state / "gcloud" / "secrets" / "gateway-env"
+    newest = max(int(f.name) for f in folder.iterdir() if f.name.isdigit())
+    (folder / str(newest + 1)).write_text("".join(
+        line + "\n" for line in gateway_env_lines(env) if not line.startswith("CX_AGENT_KEY=")))
+    r = env.run("gcp-deploy.sh", **WOO_ON_HP)
+    assert r.returncode != 0 and "no CX_AGENT_KEY" in r.stderr and not gcloud_calls(env, "run deploy")
+
+
+def gateway_env_lines(env):
+    return gcp_secret(env, "gateway-env").splitlines()

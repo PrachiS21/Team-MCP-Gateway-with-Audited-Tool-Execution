@@ -142,3 +142,21 @@ async def test_a_requests_trace_id_reaches_its_audit_line(tmp_path):
     assert line["outcome"] == "auth_failed" and line["source"] == "api" and line["key_id"] == "ab12cd34"
     assert line[TRACE_FIELD] == f"projects/demo-project/traces/{TRACE}"
     assert KEY not in json.dumps(lines)  # the key itself is never logged
+
+
+async def test_a_rejected_mcp_key_is_logged_once_as_mcp_with_its_trace(tmp_path):
+    """The key check runs inside FastMCP's auth middleware; the trace and path middleware wrap the whole app, so the
+    refusal line carries the trace, and it is recorded once, as an MCP call (not as a call to another route)."""
+    gw = create_gateway(Settings(secret_key=generate_key(), db_url=f"sqlite:///{tmp_path / 'gw.db'}",
+                                 jobs_db_url=f"sqlite:///{tmp_path / 'jobs.db'}"))
+    with json_log_lines(project="demo-project") as lines:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gw.http_app()), base_url="http://gw") as h:
+            r = await h.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers={
+                "Authorization": f"Bearer {KEY}", "X-Cloud-Trace-Context": f"{TRACE}/7;o=1",
+                "Accept": "application/json, text/event-stream"})
+    assert r.status_code == 401
+    [line] = [l for l in lines if l.get("event") == "tool_call"]
+    assert line["outcome"] == "auth_failed" and line["source"] == "mcp" and line["key_id"] == "ab12cd34"
+    assert line[TRACE_FIELD] == f"projects/demo-project/traces/{TRACE}"
+    assert [row.source for row in gw.audit.query(outcome="auth_failed")] == ["mcp"]
+    assert KEY not in json.dumps(lines)

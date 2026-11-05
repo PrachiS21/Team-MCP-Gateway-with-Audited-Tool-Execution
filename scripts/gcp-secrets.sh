@@ -5,7 +5,8 @@
 #
 #   gateway-env          the gateway's own secrets as NAME=value lines, mounted as ONE file (GATEWAY_SECRETS_FILE):
 #                        GATEWAY_SECRET_KEY, GATEWAY_ADMIN_KEY, GATEWAY_LLM_API_KEY (the Groq key; optional), and
-#                        ADK_AGENT_KEY (the ADK agent's member key; gcp-deploy.sh seeds its user, see adk-agent/)
+#                        ADK_AGENT_KEY and CX_AGENT_KEY (member keys for the ADK agent and the Dialogflow CX
+#                        webhook; gcp-deploy.sh seeds their users so the keys survive restarts)
 #   woo-mcp-token        the token woo-mcp accepts; the gateway gets it as WOO_MCP_TOKEN
 #   gst-mcp-token        gst's MCP_SERVER_TOKEN; the gateway gets it as GST_MCP_TOKEN
 # and, only when woo-mcp runs on Cloud Run:
@@ -22,7 +23,7 @@
 # skipped at first, say) goes into a NEW version that also holds the old values; the older versions are then
 # destroyed. Destroying cannot be undone, which is fine: the new version holds everything they did.
 #
-# Read a key when you need it (this script never prints one): the admin's, or the ADK agent's with ADK_AGENT_KEY
+# Read a key when you need it (this script never prints one): the admin's, or put ADK_AGENT_KEY / CX_AGENT_KEY
 #   gcloud secrets versions access latest --secret=gateway-env | sed -n 's/^GATEWAY_ADMIN_KEY=//p'
 set -eu
 . "$(dirname "$0")/lib.sh"
@@ -83,10 +84,12 @@ if ! grep -q '^GATEWAY_LLM_API_KEY=' "$WORK/gateway.env"; then
     ADDED="$ADDED GATEWAY_LLM_API_KEY"
   fi
 fi
-if ! grep -q '^ADK_AGENT_KEY=' "$WORK/gateway.env"; then  # also added to a gateway-env made before the ADK agent
-  printf 'ADK_AGENT_KEY=wmcp_%s_%s\n' "$(hex 4)" "$(hex 32)" >> "$WORK/gateway.env"
-  ADDED="$ADDED ADK_AGENT_KEY"
-fi
+for name in ADK_AGENT_KEY CX_AGENT_KEY; do  # also added to a gateway-env made before them
+  if ! grep -q "^$name=" "$WORK/gateway.env"; then
+    printf '%s=wmcp_%s_%s\n' "$name" "$(hex 4)" "$(hex 32)" >> "$WORK/gateway.env"  # the gateway's key format
+    ADDED="$ADDED $name"
+  fi
+done
 if [ "$GATEWAY_ENV" = kept ] && [ -n "$ADDED" ]; then GATEWAY_ENV=changed; fi
 if [ -n "$WOO_MCP_URL" ]; then
   if secret_exists woo-mcp-token; then

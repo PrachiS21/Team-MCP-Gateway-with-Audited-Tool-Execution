@@ -104,6 +104,24 @@ token. The Tailscale proxy is wired to woo-mcp alone, so no `Host` header can re
 and woo-mcp's network rule admits only that proxy and the local gateway. The HP must be on for the woo tools to work;
 when it's off, the gateway's other tools keep working.
 
+**3. Optional: a Dialogflow CX agent that answers through the gateway.** CX is billed per request once its trial
+credit is used (about $0.007 per text request for a flow; check the pricing page first), so delete the CX agent after
+the demo. The webhook offers the model read-only tools only; `CX_TOOLS` narrows them further, for example to products
+and GST, before you put the agent on a public website.
+1. In the Conversational Agents (Dialogflow CX) console, create a flow-based agent.
+2. Manage > Webhooks > Create:
+   - URL: `https://<gateway>/api/cx/webhook` (`gcp-deploy.sh` prints it);
+   - timeout: 30 s;
+   - header: `Authorization: Bearer <CX_AGENT_KEY>`, read from `gateway-env` like the admin key.
+
+   It must be the CX member's key: the webhook refuses an admin's. If the console does not accept an `Authorization` header, tell me, and the gateway can take the key in another header.
+3. Default Start Flow > Start Page > event handler `sys.no-match-default` > fulfillment: call the webhook. Every message no route handles then goes to the gateway, and the conversation is kept in the session parameter `gw_history`.
+4. Try it in the simulator:
+   - "how much is the demo mug?" is looked up;
+   - "delete product 12" is politely refused, because no tool that changes anything is offered.
+
+   The calls show in the dashboard's audit page with source "cx".
+
 **How it stays free:**
 - **Services:** no instance while idle, CPU only during requests, and a cap on instances.
 - **Secrets:** three secret values (five with woo-mcp on Cloud Run), inside Secret Manager's free six. Old versions are destroyed, because every version that isn't destroyed is billed.
