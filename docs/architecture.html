@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Prachi">
+<title>Team MCP Gateway Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: an engineering spec sheet. One high-level diagram, then numbered zoom levels (LLD 1-5), each a figure plus a compact table. */
+:root {
+  color-scheme: light;
+  --bg: #f3f5f7; --paper: #ffffff; --ink: #18232d; --muted: #5b6a76; --rule: #d3dbe1;
+  --plat: #1f6f8b; --plat-soft: #e3f0f5;      /* namespace platform */
+  --store: #a2611a; --store-soft: #f8eedf;    /* namespace store-main */
+  --ext: #6a4fb3; --ext-soft: #eeeaf8;        /* outside the cluster */
+  --cred: #b2283a; --cred-soft: #fbe7ea;      /* a credential crossing a hop */
+  --ok: #2b7a4b;
+  --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f151a; --paper: #162029; --ink: #dfe7ed; --muted: #94a4b0; --rule: #2b3a46;
+  --plat: #5fb7d6; --plat-soft: #15323d; --store: #e0a25a; --store-soft: #3a2a17;
+  --ext: #a993ec; --ext-soft: #2a2244; --cred: #f07d8c; --cred-soft: #3d1c22; --ok: #6fcf95; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f151a; --paper: #162029; --ink: #dfe7ed; --muted: #94a4b0; --rule: #2b3a46;
+  --plat: #5fb7d6; --plat-soft: #15323d; --store: #e0a25a; --store-soft: #3a2a17;
+  --ext: #a993ec; --ext-soft: #2a2244; --cred: #f07d8c; --cred-soft: #3d1c22; --ok: #6fcf95; color-scheme: dark }
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 15px; line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 64px; }
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 40px; }
+header.top { display: grid; gap: 10px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.byline { font-size: 14px; color: var(--muted); }
+h1 { font-size: clamp(28px, 4.2vw, 40px); line-height: 1.12; margin: 0; letter-spacing: -.01em; text-wrap: balance; }
+h2 { font-size: 22px; margin: 0; text-wrap: balance; }
+h3 { font-size: 16px; margin: 0; }
+p { margin: 0; max-width: 72ch; }
+.lede { color: var(--muted); font-size: 16.5px; }
+code, .mono { font-family: var(--mono); font-size: .86em; }
+section { display: grid; gap: 16px; }
+.sec-head { display: grid; gap: 6px; border-top: 2px solid var(--ink); padding-top: 12px; }
+.sec-head .eyebrow { color: var(--ink); }
+figure { margin: 0; background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; padding: 14px; display: grid; gap: 10px; }
+.scroll { overflow-x: auto; }
+figure svg { display: block; width: 100%; height: auto; min-width: 880px; color: var(--ink); font-family: var(--sans); }
+figcaption { color: var(--muted); font-size: 13.5px; max-width: 90ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid; display: inline-block; }
+.toc { display: flex; flex-wrap: wrap; gap: 8px; }
+.toc a { font-family: var(--mono); font-size: 12.5px; color: var(--ink); text-decoration: none; border: 1px solid var(--rule); background: var(--paper); border-radius: 999px; padding: 4px 11px; }
+.toc a:hover, .toc a:focus-visible { border-color: var(--plat); outline: none; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+.cols > * { min-width: 0; }
+.tablewrap { overflow-x: auto; background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+thead th { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+tbody tr:last-child > * { border-bottom: none; }
+.chip { display: inline-block; font-family: var(--mono); font-size: 11.5px; border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+.chip.cred { background: var(--cred-soft); color: var(--cred); }
+.chip.plat { background: var(--plat-soft); color: var(--plat); }
+.chip.store { background: var(--store-soft); color: var(--store); }
+.chip.ext { background: var(--ext-soft); color: var(--ext); }
+
+/* SVG classes (colors from the theme tokens) */
+svg .box { fill: var(--paper); stroke: var(--ink); stroke-width: 1.2; }
+svg .plat { fill: var(--plat-soft); stroke: var(--plat); stroke-width: 1.4; }
+svg .store { fill: var(--store-soft); stroke: var(--store); stroke-width: 1.4; }
+svg .ext { fill: var(--ext-soft); stroke: var(--ext); stroke-width: 1.4; stroke-dasharray: 5 4; }
+svg .ns-plat { fill: none; stroke: var(--plat); stroke-width: 1.2; stroke-dasharray: 2 3; }
+svg .ns-store { fill: none; stroke: var(--store); stroke-width: 1.2; stroke-dasharray: 2 3; }
+svg .cluster { fill: none; stroke: var(--muted); stroke-width: 1.4; stroke-dasharray: 8 5; }
+svg .oneoff { fill: var(--store-soft); stroke: var(--store); stroke-width: 1.4; stroke-dasharray: 5 4; }
+svg .edge { stroke: var(--ink); stroke-width: 1.4; fill: none; }
+svg .edge-cred { stroke: var(--cred); stroke-width: 1.8; fill: none; }
+svg .edge-ext { stroke: var(--ext); stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+svg .life { stroke: var(--rule); stroke-width: 1.4; stroke-dasharray: 3 4; }
+svg .t { fill: var(--ink); font-size: 13px; }
+svg .tb { fill: var(--ink); font-size: 13.5px; font-weight: 600; }
+svg .ts { fill: var(--muted); font-size: 11.5px; }
+svg .tm { fill: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+svg .tc { fill: var(--cred); font-size: 11.5px; font-family: var(--mono); }
+svg .tp { fill: var(--plat); font-size: 11px; font-family: var(--mono); letter-spacing: .06em; }
+svg .tst { fill: var(--store); font-size: 11px; font-family: var(--mono); letter-spacing: .06em; }
+svg .tx { fill: var(--ext); font-size: 11.5px; }
+svg .num { fill: var(--ink); }
+svg .numt { fill: var(--paper); font-size: 11px; font-weight: 600; font-family: var(--mono); }
+svg .ah { fill: var(--ink); } svg .ahc { fill: var(--cred); } svg .ahx { fill: var(--ext); }
+@media (prefers-reduced-motion: no-preference) { .toc a { transition: border-color .15s; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <span class="eyebrow">System design · WooCommerce on Kubernetes · Team MCP gateway</span>
+    <h1>One MCP endpoint in front of every server the team uses</h1>
+    <p class="byline">Author: Prachi</p>
+    <p class="lede">A WooCommerce store runs in a Kubernetes cluster next to a gateway. Admins register MCP servers once; every member reaches all of them through <code>/mcp</code> with a personal API key, from an MCP client or from a chat agent in the dashboard. Members never see the servers' credentials, and every call lands in an audit log.</p>
+    <nav class="toc" aria-label="Sections">
+      <a href="#hld">High-level design</a><a href="#lld1">LLD 1 · Gateway internals</a><a href="#lld2">LLD 2 · One tool call</a>
+      <a href="#lld3">LLD 3 · Chat agent</a><a href="#lld4">LLD 4 · woo-mcp</a><a href="#lld5">LLD 5 · Kubernetes and isolation</a><a href="#ab">Two clients compared</a>
+    </nav>
+  </header>
+
+  <!-- ============================== HLD ============================== -->
+  <section id="hld">
+    <div class="sec-head"><span class="eyebrow">High-level design</span><h2>Who talks to what, and where the boundaries are</h2></div>
+    <figure>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--plat-soft);border-color:var(--plat)"></i>namespace <code>platform</code></span>
+        <span><i class="sw" style="background:var(--store-soft);border-color:var(--store)"></i>namespace <code>store-main</code></span>
+        <span><i class="sw" style="background:var(--ext-soft);border-color:var(--ext);border-style:dashed"></i>outside the cluster</span>
+        <span><i class="sw" style="background:transparent;border-color:var(--cred)"></i>red arrow: carries a credential</span>
+      </div>
+      <div class="scroll">
+      <svg viewBox="0 0 1300 600" role="img" aria-label="Shoppers, dashboard users and MCP clients enter through Traefik. The platform namespace holds the dashboard, the gateway and two MCP servers; the store-main namespace holds woo-mcp, WordPress, MariaDB and the setup Job. Only the gateway calls the MCP servers; the gateway alone reaches the LLM API.">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahc"/></marker>
+          <marker id="ax" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahx"/></marker>
+        </defs>
+        <rect class="box" x="20" y="95" width="170" height="54" rx="6"/><text class="tb" x="105" y="118" text-anchor="middle">Shopper</text><text class="ts" x="105" y="136" text-anchor="middle">browser, storefront</text>
+        <rect class="box" x="20" y="215" width="170" height="62" rx="6"/><text class="tb" x="105" y="238" text-anchor="middle">Admin · Member A</text><text class="ts" x="105" y="256" text-anchor="middle">browser: dashboard</text><text class="ts" x="105" y="270" text-anchor="middle">and chat</text>
+        <rect class="box" x="20" y="345" width="170" height="62" rx="6"/><text class="tb" x="105" y="368" text-anchor="middle">Member B</text><text class="ts" x="105" y="386" text-anchor="middle">MCP client: Claude Code,</text><text class="ts" x="105" y="400" text-anchor="middle">Cursor, Inspector</text>
+        <rect class="ext" x="20" y="490" width="170" height="54" rx="6"/><text class="tb" x="105" y="513" text-anchor="middle">Client's own model</text><text class="tx" x="105" y="531" text-anchor="middle">e.g. Anthropic</text>
+        <line class="edge-ext" x1="105" y1="407" x2="105" y2="486" marker-end="url(#ax)"/><text class="tx" x="114" y="452">B's own login</text>
+
+        <rect class="box" x="240" y="195" width="150" height="180" rx="6"/>
+        <text class="tb" x="315" y="222" text-anchor="middle">Traefik Ingress</text>
+        <text class="tm" x="315" y="250" text-anchor="middle">shop.&lt;ip&gt;.sslip.io</text>
+        <text class="ts" x="315" y="265" text-anchor="middle">→ WordPress</text>
+        <text class="tm" x="315" y="295" text-anchor="middle">app.&lt;ip&gt;.sslip.io</text>
+        <text class="ts" x="315" y="310" text-anchor="middle">/ → dashboard</text>
+        <text class="ts" x="315" y="325" text-anchor="middle">/api, /mcp → gateway</text>
+        <text class="ts" x="315" y="355" text-anchor="middle">nothing else routed</text>
+
+        <line class="edge" x1="190" y1="122" x2="238" y2="232" marker-end="url(#a)"/>
+        <line class="edge" x1="190" y1="246" x2="238" y2="262" marker-end="url(#a)"/><text class="tc" x="194" y="296">cookie</text>
+        <line class="edge-cred" x1="190" y1="376" x2="238" y2="336" marker-end="url(#ac)"/><text class="tc" x="196" y="384">Bearer wmcp_…</text>
+
+        <rect class="cluster" x="425" y="18" width="740" height="566" rx="10"/><text class="tm" x="440" y="575">k3d / k3s cluster</text>
+        <rect class="ns-plat" x="445" y="34" width="700" height="258" rx="8"/><text class="tp" x="460" y="54">NAMESPACE platform</text>
+        <rect class="ns-store" x="445" y="312" width="700" height="244" rx="8"/><text class="tst" x="460" y="332">NAMESPACE store-main</text>
+
+        <rect class="plat" x="465" y="68" width="170" height="52" rx="6"/><text class="tb" x="550" y="91" text-anchor="middle">dashboard</text><text class="ts" x="550" y="108" text-anchor="middle">React, nginx, static</text>
+        <rect class="plat" x="465" y="148" width="270" height="120" rx="6"/><text class="tb" x="600" y="172" text-anchor="middle">gateway</text>
+        <text class="ts" x="600" y="192" text-anchor="middle">/mcp · /api · chat agent</text><text class="ts" x="600" y="208" text-anchor="middle">keys, audit log, registry</text>
+        <text class="ts" x="600" y="224" text-anchor="middle">1 replica · Recreate</text><text class="tm" x="600" y="252" text-anchor="middle">PVC gateway-data (SQLite)</text>
+
+        <rect class="plat" x="830" y="68" width="190" height="48" rx="6"/><text class="tb" x="925" y="89" text-anchor="middle">gst</text><text class="ts" x="925" y="106" text-anchor="middle">GST calculator (mine)</text>
+        <rect class="plat" x="830" y="132" width="190" height="48" rx="6"/><text class="tb" x="925" y="153" text-anchor="middle">everything</text><text class="ts" x="925" y="170" text-anchor="middle">MCP reference, third party</text>
+
+        <rect class="plat" x="465" y="350" width="200" height="54" rx="6"/><text class="tb" x="565" y="373" text-anchor="middle">woo-mcp</text><text class="ts" x="565" y="391" text-anchor="middle">MCP server (mine)</text>
+        <rect class="store" x="800" y="350" width="320" height="54" rx="6"/><text class="tb" x="960" y="373" text-anchor="middle">WordPress 7.1.3 + WooCommerce 11.2.1</text><text class="tm" x="960" y="391" text-anchor="middle">PVC wordpress-data</text>
+        <rect class="store" x="800" y="470" width="320" height="54" rx="6"/><text class="tb" x="960" y="493" text-anchor="middle">MariaDB 11 (StatefulSet)</text><text class="tm" x="960" y="511" text-anchor="middle">PVC mariadb-data</text>
+        <rect class="oneoff" x="465" y="470" width="200" height="54" rx="6"/><text class="tb" x="565" y="493" text-anchor="middle">setup Job</text><text class="ts" x="565" y="511" text-anchor="middle">WP-CLI, every revision</text>
+
+        <line class="edge" x1="390" y1="225" x2="463" y2="100" marker-end="url(#a)"/>
+        <line class="edge" x1="390" y1="275" x2="463" y2="215" marker-end="url(#a)"/>
+        <polyline class="edge" points="390,352 435,352 435,440 770,440 770,392 798,392" marker-end="url(#a)"/>
+
+        <line class="edge-cred" x1="735" y1="170" x2="828" y2="96" marker-end="url(#ac)"/>
+        <line class="edge" x1="735" y1="188" x2="828" y2="158" marker-end="url(#a)"/>
+        <line class="edge-cred" x1="560" y1="268" x2="560" y2="348" marker-end="url(#ac)"/><text class="tc" x="568" y="314">Bearer token</text>
+        <text class="tc" x="752" y="120">token</text><text class="ts" x="752" y="178">no auth</text>
+        <rect class="ext" x="1180" y="212" width="110" height="54" rx="6"/><text class="tb" x="1235" y="235" text-anchor="middle">LLM API</text><text class="tx" x="1235" y="253" text-anchor="middle">Groq</text>
+        <line class="edge-cred" x1="735" y1="246" x2="1178" y2="240" marker-end="url(#ac)"/><text class="tc" x="905" y="234">LLM key · HTTPS · chat only</text>
+        <line class="edge-cred" x1="665" y1="370" x2="798" y2="370" marker-end="url(#ac)"/><text class="tc" x="675" y="362">REST v3 · ck/cs</text>
+        <line class="edge" x1="960" y1="404" x2="960" y2="468" marker-end="url(#a)"/><text class="ts" x="968" y="440">SQL</text>
+        <line class="edge" x1="665" y1="497" x2="798" y2="497" marker-end="url(#a)"/><text class="ts" x="690" y="489">installs, configures</text>
+      </svg>
+      </div>
+      <figcaption>Two host names are public; everything else is a ClusterIP Service. Only the gateway calls the three MCP servers, and only the gateway (for the chat) leaves the cluster. Member B's client talks to its own model separately; that link never touches the cluster.</figcaption>
+    </figure>
+
+    <div class="cols">
+      <div class="tablewrap"><table>
+        <thead><tr><th>Component</th><th>Job</th></tr></thead>
+        <tbody>
+          <tr><td><span class="chip store">Store</span></td><td>WordPress + WooCommerce + MariaDB. Installed unattended by a Job: currency INR, time zone IST, cash on delivery, and the REST API key woo-mcp uses.</td></tr>
+          <tr><td><span class="chip plat">woo-mcp</span></td><td>Turns the WooCommerce REST API into MCP tools over Streamable HTTP.</td></tr>
+          <tr><td><span class="chip plat">gst · everything</span></td><td>Two more upstream MCP servers: one of mine, one third-party.</td></tr>
+          <tr><td><span class="chip plat">gateway</span></td><td>MCP server to clients, MCP client to every registered server. Auth, audit, routing, timeouts, admin API, chat agent.</td></tr>
+          <tr><td><span class="chip plat">dashboard</span></td><td>Servers, members and keys, audit log, chat. Static files only.</td></tr>
+        </tbody></table></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Decision</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Tools named <code>&lt;server&gt;__&lt;tool&gt;</code></td><td>Two servers can share a tool name; one can never shadow another.</td></tr>
+          <tr><td>Gateway's own credential per server</td><td>Client keys are never forwarded, so one bad server cannot collect them.</td></tr>
+          <tr><td>Two Helm charts</td><td><code>store</code> per store and namespace, <code>platform</code> once. Local vs production: values only.</td></tr>
+          <tr><td>SQLite on a volume</td><td>Simple for one replica; scaling out would need Postgres.</td></tr>
+          <tr><td>Setup Job, not init container</td><td>WordPress writes its files when its own container starts; the Job waits for them.</td></tr>
+        </tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ============================== LLD 1 ============================== -->
+  <section id="lld1">
+    <div class="sec-head"><span class="eyebrow">LLD 1</span><h2>Gateway internals: three ways in, one way out</h2>
+      <p>Every request, whether MCP, dashboard or chat, reaches the servers through the same <code>GatewayService</code>, so the audit log, routing and timeouts cannot differ between paths.</p></div>
+    <figure>
+      <div class="scroll">
+      <svg viewBox="0 0 1120 640" role="img" aria-label="Three entry points: /mcp with a bearer key, /api with a session cookie, and /api/chat. All tool calls go through GatewayService, which writes the audit row first, then the UpstreamManager routes to one UpstreamClient per server. The registry, auth and audit services sit on SQLite files on the gateway's volume.">
+        <defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="bx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahx"/></marker></defs>
+        <rect class="box" x="20" y="20" width="250" height="46" rx="6"/><text class="tb" x="145" y="40" text-anchor="middle">POST /mcp</text><text class="tm" x="145" y="57" text-anchor="middle">Bearer wmcp_&lt;id&gt;_&lt;secret&gt;</text>
+        <rect class="box" x="310" y="20" width="250" height="46" rx="6"/><text class="tb" x="435" y="40" text-anchor="middle">/api/*</text><text class="tm" x="435" y="57" text-anchor="middle">cookie gw_session</text>
+        <rect class="box" x="600" y="20" width="250" height="46" rx="6"/><text class="tb" x="725" y="40" text-anchor="middle">POST /api/chat</text><text class="tm" x="725" y="57" text-anchor="middle">cookie gw_session</text>
+        <rect class="plat" x="20" y="96" width="250" height="62" rx="6"/><text class="tb" x="145" y="117" text-anchor="middle">GatewayKeyVerifier</text><text class="ts" x="145" y="134" text-anchor="middle">public id → row; SHA-256 compare</text><text class="ts" x="145" y="149" text-anchor="middle">revoked or inactive → 401</text>
+        <rect class="plat" x="310" y="96" width="540" height="62" rx="6"/><text class="tb" x="580" y="117" text-anchor="middle">Session check (every request)</text><text class="ts" x="580" y="134" text-anchor="middle">token hash → session (8 h) → its key still valid → user and role</text><text class="ts" x="580" y="149" text-anchor="middle">admin-only routes → 403 for members · POST/PATCH must be JSON</text>
+        <rect class="plat" x="20" y="188" width="250" height="62" rx="6"/><text class="tb" x="145" y="209" text-anchor="middle">GatewayMiddleware</text><text class="ts" x="145" y="226" text-anchor="middle">answers tools/list and tools/call</text><text class="ts" x="145" y="241" text-anchor="middle">no tools registered in code</text>
+        <rect class="plat" x="310" y="188" width="250" height="62" rx="6"/><text class="tb" x="435" y="209" text-anchor="middle">Admin API (api.py)</text><text class="ts" x="435" y="226" text-anchor="middle">servers · users · keys</text><text class="ts" x="435" y="241" text-anchor="middle">audit log · events</text>
+        <rect class="plat" x="600" y="188" width="250" height="62" rx="6"/><text class="tb" x="725" y="209" text-anchor="middle">ChatAgent (chat.py)</text><text class="ts" x="725" y="226" text-anchor="middle">tool loop as the logged-in user</text><text class="ts" x="725" y="241" text-anchor="middle">8 rounds · 12 calls · 180 s</text>
+        <rect class="ext" x="900" y="188" width="200" height="62" rx="6"/><text class="tb" x="1000" y="214" text-anchor="middle">LLM API</text><text class="tx" x="1000" y="232" text-anchor="middle">OpenAI-compatible</text>
+        <line class="edge-ext" x1="850" y1="219" x2="898" y2="219" marker-end="url(#bx)"/>
+        <line class="edge" x1="145" y1="66" x2="145" y2="94" marker-end="url(#b)"/><line class="edge" x1="435" y1="66" x2="435" y2="94" marker-end="url(#b)"/><line class="edge" x1="725" y1="66" x2="725" y2="94" marker-end="url(#b)"/>
+        <line class="edge" x1="145" y1="158" x2="145" y2="186" marker-end="url(#b)"/><line class="edge" x1="435" y1="158" x2="435" y2="186" marker-end="url(#b)"/><line class="edge" x1="725" y1="158" x2="725" y2="186" marker-end="url(#b)"/>
+        <rect class="plat" x="20" y="290" width="830" height="92" rx="6"/>
+        <text class="tb" x="435" y="312" text-anchor="middle">GatewayService: the only place a tool call is recorded and routed</text>
+        <g class="ts">
+          <circle class="num" cx="52" cy="340" r="10"/><text class="numt" x="52" y="344" text-anchor="middle">1</text><text class="t" x="68" y="344">audit row "started"; if it fails, refuse</text>
+          <circle class="num" cx="342" cy="340" r="10"/><text class="numt" x="342" y="344" text-anchor="middle">2</text><text class="t" x="358" y="344">undo-able tool: lock resource, read "before"</text>
+          <circle class="num" cx="52" cy="366" r="10"/><text class="numt" x="52" y="370" text-anchor="middle">3</text><text class="t" x="68" y="370">call through the manager</text>
+          <circle class="num" cx="342" cy="366" r="10"/><text class="numt" x="342" y="370" text-anchor="middle">4</text><text class="t" x="358" y="370">finish audit: outcome, duration</text>
+          <circle class="num" cx="612" cy="353" r="10"/><text class="numt" x="612" y="357" text-anchor="middle">5</text><text class="t" x="628" y="350">audit failed after success?</text><text class="t" x="628" y="366">queue an undo job</text>
+        </g>
+        <line class="edge" x1="145" y1="250" x2="145" y2="288" marker-end="url(#b)"/><text class="ts" x="152" y="274">source mcp</text>
+        <line class="edge" x1="725" y1="250" x2="725" y2="288" marker-end="url(#b)"/><text class="ts" x="732" y="274">source chat</text>
+        <line class="edge" x1="435" y1="250" x2="435" y2="288" marker-end="url(#b)"/><text class="ts" x="442" y="274">status, tools</text>
+        <rect class="plat" x="20" y="420" width="830" height="58" rx="6"/><text class="tb" x="435" y="442" text-anchor="middle">UpstreamManager</text><text class="ts" x="435" y="463" text-anchor="middle">lists every enabled server in parallel · adds &lt;slug&gt;__ · routes by splitting at the first __ · hides internal tools</text>
+        <line class="edge" x1="435" y1="382" x2="435" y2="418" marker-end="url(#b)"/>
+        <rect class="box" x="20" y="516" width="260" height="58" rx="6"/><text class="tb" x="150" y="538" text-anchor="middle">UpstreamClient · woo</text><text class="ts" x="150" y="557" text-anchor="middle">Streamable HTTP · 10 s · Bearer</text>
+        <rect class="box" x="305" y="516" width="260" height="58" rx="6"/><text class="tb" x="435" y="538" text-anchor="middle">UpstreamClient · gst</text><text class="ts" x="435" y="557" text-anchor="middle">Streamable HTTP · 10 s · Bearer</text>
+        <rect class="box" x="590" y="516" width="260" height="58" rx="6"/><text class="tb" x="720" y="538" text-anchor="middle">UpstreamClient · everything</text><text class="ts" x="720" y="557" text-anchor="middle">Streamable HTTP · 10 s · none</text>
+        <line class="edge" x1="150" y1="478" x2="150" y2="514" marker-end="url(#b)"/><line class="edge" x1="435" y1="478" x2="435" y2="514" marker-end="url(#b)"/><line class="edge" x1="720" y1="478" x2="720" y2="514" marker-end="url(#b)"/>
+        <text class="ts" x="20" y="600">each client: status connected / unreachable / disabled, reason of the last failure, reconnects after "connection closed"</text>
+        <rect class="box" x="890" y="290" width="210" height="188" rx="6"/>
+        <text class="tb" x="995" y="312" text-anchor="middle">gateway.db (SQLite)</text>
+        <text class="tm" x="910" y="338">users</text><text class="tm" x="910" y="356">api_keys  (SHA-256)</text><text class="tm" x="910" y="374">sessions  (hash, 8 h)</text>
+        <text class="tm" x="910" y="392">servers   (Fernet)</text><text class="tm" x="910" y="410">audit_log</text><text class="tm" x="910" y="428">admin_events</text>
+        <text class="ts" x="910" y="460">on PVC gateway-data</text>
+        <rect class="box" x="890" y="500" width="210" height="80" rx="6"/><text class="tb" x="995" y="522" text-anchor="middle">gateway_jobs.db</text><text class="ts" x="995" y="541" text-anchor="middle">undo jobs, encrypted args</text><text class="ts" x="995" y="558" text-anchor="middle">UndoWorker: retries,</text><text class="ts" x="995" y="572" text-anchor="middle">lock, verify, give up</text>
+        <line class="edge" x1="850" y1="336" x2="888" y2="336" marker-end="url(#b)"/><text class="ts" x="852" y="330">audit</text>
+        <line class="edge" x1="850" y1="372" x2="888" y2="540" marker-end="url(#b)"/>
+        <line class="edge" x1="888" y1="449" x2="852" y2="449" marker-end="url(#b)"/><text class="ts" x="852" y="496">registry → manager every 5 s</text>
+      </svg>
+      </div>
+      <figcaption>Upstream servers come from the registry table, re-read every 5 seconds, so a server added, edited or disabled from the dashboard or the CLI is live without a restart. The WooCommerce server is registered at startup from a seed file in the chart.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================== LLD 2 ============================== -->
+  <section id="lld2">
+    <div class="sec-head"><span class="eyebrow">LLD 2</span><h2>One tool call, hop by hop, with the credential on each hop</h2>
+      <p>Member B asks Claude Code for today's orders. Red labels are the credential on that hop; each one stops at the next box.</p></div>
+    <figure>
+      <div class="scroll">
+      <svg viewBox="0 0 1120 560" role="img" aria-label="Sequence: the MCP client sends tools/call with B's key to Traefik and the gateway. The gateway verifies the key, writes the audit row, and calls woo-mcp with its own bearer token. woo-mcp calls the WordPress REST API with the consumer key and secret and X-Forwarded-Proto https. WordPress reads MariaDB. The reply returns the same way and the gateway records the outcome.">
+        <defs><marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          <marker id="cc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahc"/></marker></defs>
+        <g>
+          <rect class="box" x="20" y="16" width="150" height="44" rx="6"/><text class="tb" x="95" y="43" text-anchor="middle">MCP client (B)</text>
+          <rect class="box" x="205" y="16" width="150" height="44" rx="6"/><text class="tb" x="280" y="43" text-anchor="middle">Traefik</text>
+          <rect class="plat" x="390" y="16" width="170" height="44" rx="6"/><text class="tb" x="475" y="43" text-anchor="middle">gateway</text>
+          <rect class="plat" x="610" y="16" width="150" height="44" rx="6"/><text class="tb" x="685" y="43" text-anchor="middle">woo-mcp</text>
+          <rect class="store" x="800" y="16" width="150" height="44" rx="6"/><text class="tb" x="875" y="43" text-anchor="middle">WordPress</text>
+          <rect class="store" x="980" y="16" width="120" height="44" rx="6"/><text class="tb" x="1040" y="43" text-anchor="middle">MariaDB</text>
+        </g>
+        <line class="life" x1="95" y1="60" x2="95" y2="540"/><line class="life" x1="280" y1="60" x2="280" y2="540"/><line class="life" x1="475" y1="60" x2="475" y2="540"/>
+        <line class="life" x1="685" y1="60" x2="685" y2="540"/><line class="life" x1="875" y1="60" x2="875" y2="540"/><line class="life" x1="1040" y1="60" x2="1040" y2="540"/>
+        <line class="edge-cred" x1="95" y1="96" x2="278" y2="96" marker-end="url(#cc)"/><text class="t" x="102" y="88">1 tools/call woo__list_orders</text><text class="tc" x="102" y="112">Bearer wmcp_… (B's key)</text>
+        <line class="edge-cred" x1="280" y1="126" x2="473" y2="126" marker-end="url(#cc)"/><text class="ts" x="288" y="120">2 app.&lt;ip&gt;/mcp</text>
+        <rect class="plat" x="440" y="146" width="210" height="76" rx="4"/>
+        <text class="t" x="450" y="166">3 key → user B (SHA-256)</text><text class="t" x="450" y="186">4 audit row "started"</text><text class="t" x="450" y="206">5 woo__ → server woo</text>
+        <line class="edge-cred" x1="475" y1="246" x2="683" y2="246" marker-end="url(#cc)"/><text class="t" x="482" y="238">6 tools/call list_orders</text><text class="tc" x="482" y="262">Bearer (gateway's woo token)</text>
+        <rect class="plat" x="640" y="276" width="190" height="40" rx="4"/><text class="t" x="650" y="301">7 token check; today in IST → UTC</text>
+        <line class="edge-cred" x1="685" y1="342" x2="873" y2="342" marker-end="url(#cc)"/><text class="t" x="692" y="334">8 GET /wp-json/wc/v3/orders</text><text class="tc" x="692" y="358">Basic ck_/cs_ · X-Forwarded-Proto</text>
+        <line class="edge" x1="875" y1="380" x2="1038" y2="380" marker-end="url(#c)"/><text class="ts" x="882" y="372">9 SQL</text>
+        <line class="edge" x1="1040" y1="404" x2="877" y2="404" marker-end="url(#c)"/>
+        <line class="edge" x1="875" y1="430" x2="687" y2="430" marker-end="url(#c)"/><text class="ts" x="700" y="422">10 orders JSON</text>
+        <rect class="plat" x="580" y="442" width="210" height="28" rx="4"/><text class="t" x="590" y="461">11 strip customer data</text>
+        <line class="edge" x1="685" y1="488" x2="477" y2="488" marker-end="url(#c)"/><text class="ts" x="490" y="480">12 result</text>
+        <rect class="plat" x="380" y="496" width="190" height="26" rx="4"/><text class="t" x="390" y="514">13 audit: success, ms</text>
+        <line class="edge" x1="475" y1="532" x2="97" y2="532" marker-end="url(#c)"/><text class="ts" x="110" y="524">14 result back to the client</text>
+      </svg>
+      </div>
+      <figcaption>B's key ends at the gateway (step 3). The gateway's own token for woo-mcp ends at woo-mcp (step 7). The WooCommerce key and secret are used only by woo-mcp (step 8). WooCommerce accepts key auth only over HTTPS, so on the in-cluster HTTP hop woo-mcp sends <code>X-Forwarded-Proto: https</code> and WordPress trusts it.</figcaption>
+    </figure>
+    <div class="tablewrap"><table>
+      <thead><tr><th>When it goes wrong</th><th>What the client sees</th><th>Audit outcome</th></tr></thead>
+      <tbody>
+        <tr><td>Key wrong or revoked</td><td>HTTP 401 before any call</td><td><code>auth_failed</code>, key id only</td></tr>
+        <tr><td>Server slower than its timeout (10 s)</td><td>"The server did not answer in time."</td><td><code>error</code> · timeout</td></tr>
+        <tr><td>Server down or pod replaced</td><td>"The server is currently unreachable."; listing skips it</td><td><code>error</code> · unreachable</td></tr>
+        <tr><td>Server disabled</td><td>Tools gone from the list; a direct call is refused</td><td><code>error</code> · disabled</td></tr>
+        <tr><td>Audit database unavailable</td><td>Call refused before reaching the server</td><td>incident log</td></tr>
+      </tbody></table></div>
+  </section>
+
+  <!-- ============================== LLD 3 ============================== -->
+  <section id="lld3">
+    <div class="sec-head"><span class="eyebrow">LLD 3</span><h2>Chat agent: the tool loop runs inside the gateway</h2></div>
+    <div class="cols">
+      <figure>
+        <div class="scroll">
+        <svg viewBox="0 0 560 360" role="img" aria-label="Loop: the gateway lists the user's tools, sends them with the conversation to the LLM, runs each requested tool through GatewayService as the user, and feeds the results back until the model answers." style="min-width:520px">
+          <defs><marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs>
+          <rect class="box" x="20" y="20" width="190" height="48" rx="6"/><text class="tb" x="115" y="41" text-anchor="middle">Browser (A)</text><text class="tm" x="115" y="58" text-anchor="middle">POST /api/chat</text>
+          <rect class="plat" x="20" y="120" width="190" height="56" rx="6"/><text class="tb" x="115" y="142" text-anchor="middle">1 list A's tools</text><text class="ts" x="115" y="161" text-anchor="middle">fresh every question</text>
+          <rect class="ext" x="340" y="120" width="190" height="56" rx="6"/><text class="tb" x="435" y="142" text-anchor="middle">2 LLM</text><text class="tx" x="435" y="161" text-anchor="middle">conversation + tools</text>
+          <rect class="plat" x="340" y="250" width="190" height="56" rx="6"/><text class="tb" x="435" y="272" text-anchor="middle">3 run each call</text><text class="ts" x="435" y="291" text-anchor="middle">GatewayService as A</text>
+          <rect class="plat" x="20" y="250" width="190" height="56" rx="6"/><text class="tb" x="115" y="272" text-anchor="middle">4 results back</text><text class="ts" x="115" y="291" text-anchor="middle">as "tool" messages, cut</text>
+          <line class="edge" x1="115" y1="68" x2="115" y2="118" marker-end="url(#d)"/>
+          <line class="edge" x1="210" y1="148" x2="338" y2="148" marker-end="url(#d)"/>
+          <line class="edge" x1="435" y1="176" x2="435" y2="248" marker-end="url(#d)"/><text class="ts" x="442" y="216">tool_calls</text>
+          <line class="edge" x1="340" y1="278" x2="212" y2="278" marker-end="url(#d)"/>
+          <polyline class="edge" points="115,250 115,226 300,226 300,170 338,170" marker-end="url(#d)"/><text class="ts" x="150" y="220">next round (max 8)</text>
+          <polyline class="edge" points="530,148 548,148 548,44 212,44" marker-end="url(#d)"/><text class="ts" x="330" y="38">no tool_calls: answer + tool list</text>
+        </svg>
+        </div>
+        <figcaption>The model can only call tools offered in that round, with A's identity. Limits: 8 rounds, 12 tool calls, 180 seconds.</figcaption>
+      </figure>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Concern</th><th>How it is handled</th></tr></thead>
+        <tbody>
+          <tr><td>Acts as the logged-in user</td><td>The session cookie gives user A; every call goes through <code>GatewayService</code> with A as caller, source <code>chat</code>.</td></tr>
+          <tr><td>LLM provider</td><td>Any OpenAI-compatible <code>/chat/completions</code>: base URL, model, key. Here Groq, <code>openai/gpt-oss-120b</code>, temperature 0.</td></tr>
+          <tr><td>LLM key</td><td><span class="chip cred">LLM_API_KEY</span> in Secret <code>gateway-secrets</code>; never in the browser or a prompt.</td></tr>
+          <tr><td>Network</td><td>Gateway egress allowed to HTTPS on public addresses only, and only when a model is configured.</td></tr>
+          <tr><td>Prompt injection</td><td>Tool descriptions and results reach the model only as tool data; the system prompt says they are not instructions; results truncated; every call shown to the user.</td></tr>
+          <tr><td>Disabled or dead server</td><td>Its tools are not offered in the next question.</td></tr>
+        </tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ============================== LLD 4 ============================== -->
+  <section id="lld4">
+    <div class="sec-head"><span class="eyebrow">LLD 4</span><h2>woo-mcp: from an MCP tool call to the WooCommerce REST API</h2></div>
+    <figure>
+      <div class="scroll">
+      <svg viewBox="0 0 1120 230" role="img" aria-label="Pipeline: the bearer token is checked, the tool validates its arguments, WooClient calls the REST API with retries for reads only, errors become safe error kinds, and order results are stripped of customer data before returning.">
+        <defs><marker id="e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs>
+        <rect class="box" x="20" y="40" width="160" height="80" rx="6"/><text class="tb" x="100" y="68" text-anchor="middle">Token check</text><text class="ts" x="100" y="88" text-anchor="middle">gateway's Bearer only</text><text class="ts" x="100" y="104" text-anchor="middle">constant-time compare</text>
+        <rect class="plat" x="220" y="40" width="190" height="80" rx="6"/><text class="tb" x="315" y="68" text-anchor="middle">Tool + validation</text><text class="ts" x="315" y="88" text-anchor="middle">price must be a number</text><text class="ts" x="315" y="104" text-anchor="middle">"today" in IST → UTC</text>
+        <rect class="plat" x="450" y="40" width="210" height="80" rx="6"/><text class="tb" x="555" y="68" text-anchor="middle">WooClient</text><text class="ts" x="555" y="88" text-anchor="middle">GET retried once (network,</text><text class="ts" x="555" y="104" text-anchor="middle">502-504); writes never</text>
+        <rect class="store" x="700" y="40" width="180" height="80" rx="6"/><text class="tb" x="790" y="68" text-anchor="middle">REST /wc/v3</text><text class="tc" x="790" y="88" text-anchor="middle">Basic ck_/cs_</text><text class="tm" x="790" y="104" text-anchor="middle">X-Forwarded-Proto</text>
+        <rect class="plat" x="920" y="40" width="180" height="80" rx="6"/><text class="tb" x="1010" y="68" text-anchor="middle">Shapes</text><text class="ts" x="1010" y="88" text-anchor="middle">orders without name,</text><text class="ts" x="1010" y="104" text-anchor="middle">email, phone, address</text>
+        <line class="edge" x1="180" y1="80" x2="218" y2="80" marker-end="url(#e)"/><line class="edge" x1="410" y1="80" x2="448" y2="80" marker-end="url(#e)"/><line class="edge" x1="660" y1="80" x2="698" y2="80" marker-end="url(#e)"/><line class="edge" x1="880" y1="80" x2="918" y2="80" marker-end="url(#e)"/>
+        <text class="ts" x="20" y="160">Errors become one of five safe kinds: auth · not_found · invalid · unavailable · unexpected (no URLs, no keys, store HTML stripped).</text>
+        <text class="ts" x="20" y="182">The real store answers an unknown order id with 400 "ID is invalid."; the client maps it to not_found.</text>
+        <text class="ts" x="20" y="204">/healthz: process up. /readyz: the store accepts the key (cached 5 s), so the pod is Ready only when the whole chain works.</text>
+      </svg>
+      </div>
+      <figcaption>Tools: <code>list_products</code>, <code>get_product</code>, <code>create_product</code>, <code>list_orders</code>, <code>get_order</code>, <code>update_order_status</code>, plus <code>delete_product</code>, which the gateway keeps hidden and uses only to undo a product creation. Verified against a real WooCommerce with 18 contract tests.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================== LLD 5 ============================== -->
+  <section id="lld5">
+    <div class="sec-head"><span class="eyebrow">LLD 5</span><h2>Kubernetes objects, credentials and isolation</h2>
+      <p>NetworkPolicies deny everything by default in both namespaces; each row below is one allowed connection. Anything not listed is dropped.</p></div>
+    <div class="cols">
+      <div class="tablewrap"><table>
+        <thead><tr><th>From</th><th>To</th><th>Port</th></tr></thead>
+        <tbody>
+          <tr><td>Traefik (kube-system)</td><td>WordPress</td><td>80</td></tr>
+          <tr><td>Traefik</td><td>gateway</td><td>8000</td></tr>
+          <tr><td>Traefik</td><td>dashboard</td><td>8080</td></tr>
+          <tr><td>gateway (platform)</td><td>woo-mcp (store-main)</td><td>8000</td></tr>
+          <tr><td>gateway</td><td>gst, everything</td><td>8000, 3001</td></tr>
+          <tr><td>gateway</td><td>public internet, HTTPS (LLM)</td><td>443</td></tr>
+          <tr><td>woo-mcp</td><td>WordPress</td><td>80</td></tr>
+          <tr><td>WordPress, setup Job</td><td>MariaDB</td><td>3306</td></tr>
+          <tr><td>setup Job</td><td>internet (plugin download)</td><td>80, 443</td></tr>
+          <tr><td>every pod</td><td>cluster DNS</td><td>53</td></tr>
+          <tr><td>gst, everything, dashboard</td><td colspan="2">nothing at all (egress empty)</td></tr>
+        </tbody></table></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Secret</th><th>Keys</th><th>Used by</th></tr></thead>
+        <tbody>
+          <tr><td><code>store-db</code></td><td><span class="chip cred">DB_PASSWORD</span> <span class="chip cred">DB_ROOT_PASSWORD</span></td><td>MariaDB, WordPress, setup Job</td></tr>
+          <tr><td><code>store-wordpress</code></td><td><span class="chip cred">WP_ADMIN_PASSWORD</span> <span class="chip cred">WC_CONSUMER_KEY</span> <span class="chip cred">WC_CONSUMER_SECRET</span></td><td>setup Job (registers the key), woo-mcp</td></tr>
+          <tr><td><code>store-mcp</code></td><td><span class="chip cred">MCP_SERVER_TOKEN</span></td><td>woo-mcp (expects it)</td></tr>
+          <tr><td><code>gateway-secrets</code></td><td><span class="chip cred">GATEWAY_SECRET_KEY</span> <span class="chip cred">WOO_MCP_TOKEN</span> <span class="chip cred">GST_MCP_TOKEN</span> <span class="chip cred">LLM_API_KEY</span></td><td>gateway; <code>GST_MCP_TOKEN</code> also gst</td></tr>
+        </tbody></table></div>
+    </div>
+    <div class="cols">
+      <div class="tablewrap"><table>
+        <thead><tr><th>Workload</th><th>Kind · storage</th><th>Probes</th></tr></thead>
+        <tbody>
+          <tr><td>MariaDB</td><td>StatefulSet · PVC <code>mariadb-data</code></td><td>startup, ready, live: <code>healthcheck.sh</code></td></tr>
+          <tr><td>WordPress</td><td>Deployment, Recreate · PVC <code>wordpress-data</code></td><td>startup + ready <code>/wp-login.php</code>, live TCP</td></tr>
+          <tr><td>setup Job</td><td>Job, named per Helm revision</td><td>none (it finishes)</td></tr>
+          <tr><td>woo-mcp</td><td>Deployment</td><td>ready <code>/readyz</code> (store accepts key), live <code>/healthz</code></td></tr>
+          <tr><td>gateway</td><td>Deployment, 1 replica, Recreate · PVC <code>gateway-data</code></td><td>ready <code>/readyz</code> (database), live <code>/healthz</code></td></tr>
+          <tr><td>gst · everything</td><td>Deployment</td><td>HTTP · TCP</td></tr>
+          <tr><td>dashboard</td><td>Deployment (nginx)</td><td>HTTP <code>/</code></td></tr>
+        </tbody></table></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Hardening</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td>Requests and limits on every container, LimitRange defaults</td><td>both namespaces</td></tr>
+          <tr><td>Probe timeouts set explicitly (5 s)</td><td>every probe</td></tr>
+          <tr><td>Non-root, read-only root filesystem, all capabilities dropped; only <code>/tmp</code> (and <code>/data</code>) writable</td><td>woo-mcp, gst, everything, gateway, dashboard</td></tr>
+          <tr><td>No Kubernetes API token mounted</td><td>my workloads</td></tr>
+          <tr><td>No Secret in the third-party server's pod</td><td>everything</td></tr>
+          <tr><td>Health endpoints not routed (404 from outside)</td><td>Ingress</td></tr>
+          <tr><td>Upstream URLs checked: metadata and link-local blocked</td><td>gateway registry</td></tr>
+        </tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ============================== A vs B ============================== -->
+  <section id="ab">
+    <div class="sec-head"><span class="eyebrow">Two clients compared</span><h2>Member A in the dashboard chat, member B in an MCP client</h2></div>
+    <div class="tablewrap"><table>
+      <thead><tr><th></th><th><span class="chip plat">A · dashboard chat</span></th><th><span class="chip ext">B · Claude Code</span></th></tr></thead>
+      <tbody>
+        <tr><td>Who runs the tool loop</td><td>the gateway, in the cluster</td><td>the client, on B's machine</td></tr>
+        <tr><td>Model and its credential</td><td>Groq, key in a Kubernetes Secret</td><td>the client's own model and login; never seen by the gateway</td></tr>
+        <tr><td>How the gateway identifies the user</td><td>session cookie (HttpOnly, SameSite Strict)</td><td><code>Authorization: Bearer wmcp_…</code> on every call</td></tr>
+        <tr><td>Does the model's provider see a gateway key?</td><td>no</td><td>no: the client program adds the key only to its calls to the gateway</td></tr>
+        <tr><td>Does the provider see tool results?</td><td>yes, Groq</td><td>yes, the client's provider</td></tr>
+        <tr><td>Audit source</td><td><code>chat</code></td><td><code>mcp</code></td></tr>
+        <tr><td>After a server is disabled</td><td>gone on the next question</td><td>gone after reconnect; direct calls refused at once</td></tr>
+      </tbody></table></div>
+  </section>
+</div>
+</body>
+</html>

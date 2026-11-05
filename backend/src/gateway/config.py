@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from gateway.logs import LOG_FORMATS
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -12,9 +14,10 @@ class Settings:
     db_url: str = "sqlite:///gateway.db"  # GATEWAY_DB_URL: registry, users, keys, audit log
     jobs_db_url: str = "sqlite:///gateway_jobs.db"  # GATEWAY_JOBS_DB_URL: undo jobs (separate file on purpose)
     admin_email: str | None = None  # GATEWAY_ADMIN_EMAIL: first admin, created at startup
+    admin_key: str | None = field(default=None, repr=False)  # GATEWAY_ADMIN_KEY: that admin's key, from a secret manager
     allow_loopback: bool = False  # GATEWAY_ALLOW_LOOPBACK=1: dev only, lets upstream URLs point at localhost
     host: str = "0.0.0.0"  # GATEWAY_HOST
-    port: int = 8000  # GATEWAY_PORT
+    port: int = 8000  # GATEWAY_PORT, else PORT (set by Cloud Run)
     incident_log: Path | None = None  # GATEWAY_INCIDENT_LOG: JSONL file that survives an audit DB outage
     worker_interval: float = 2.0  # GATEWAY_WORKER_INTERVAL: seconds between undo-worker passes
     sync_interval: float = 5.0  # GATEWAY_SYNC_INTERVAL: seconds between registry -> live-server syncs
@@ -26,6 +29,8 @@ class Settings:
     llm_model: str | None = None  # GATEWAY_LLM_MODEL, e.g. a tool-calling model your provider offers
     llm_api_key: str | None = field(default=None, repr=False)  # GATEWAY_LLM_API_KEY: from a Kubernetes Secret
     llm_timeout: float = 60.0  # GATEWAY_LLM_TIMEOUT: seconds per LLM request
+    log_format: str = "text"  # GATEWAY_LOG_FORMAT: "text" (readable) or "json" (one object per line, for Cloud Logging)
+    gcp_project: str | None = None  # GATEWAY_GCP_PROJECT: with json logs, links each line to its request's trace
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -34,14 +39,20 @@ class Settings:
         if not key:
             raise SystemExit("GATEWAY_SECRET_KEY is not set. Generate one with: "
                              "python -c 'from gateway.registry.crypto import generate_key; print(generate_key())'")
+        if env.get("GATEWAY_ADMIN_KEY") and not env.get("GATEWAY_ADMIN_EMAIL"):
+            raise SystemExit("GATEWAY_ADMIN_KEY is set but GATEWAY_ADMIN_EMAIL is not: the key needs an admin to belong to")
+        log_format = env.get("GATEWAY_LOG_FORMAT") or cls.log_format
+        if log_format not in LOG_FORMATS:
+            raise SystemExit(f"GATEWAY_LOG_FORMAT must be one of {', '.join(LOG_FORMATS)}")
         return cls(
             secret_key=key,
             db_url=env.get("GATEWAY_DB_URL", cls.db_url),
             jobs_db_url=env.get("GATEWAY_JOBS_DB_URL", cls.jobs_db_url),
             admin_email=env.get("GATEWAY_ADMIN_EMAIL") or None,
+            admin_key=env.get("GATEWAY_ADMIN_KEY") or None,
             allow_loopback=env.get("GATEWAY_ALLOW_LOOPBACK", "") in ("1", "true", "yes"),
             host=env.get("GATEWAY_HOST", cls.host),
-            port=int(env.get("GATEWAY_PORT", cls.port)),
+            port=int(env.get("GATEWAY_PORT") or env.get("PORT") or cls.port),
             incident_log=Path(env["GATEWAY_INCIDENT_LOG"]) if env.get("GATEWAY_INCIDENT_LOG") else None,
             worker_interval=float(env.get("GATEWAY_WORKER_INTERVAL", cls.worker_interval)),
             sync_interval=float(env.get("GATEWAY_SYNC_INTERVAL", cls.sync_interval)),
@@ -52,4 +63,6 @@ class Settings:
             llm_model=env.get("GATEWAY_LLM_MODEL") or None,
             llm_api_key=env.get("GATEWAY_LLM_API_KEY") or None,
             llm_timeout=float(env.get("GATEWAY_LLM_TIMEOUT", cls.llm_timeout)),
+            log_format=log_format,
+            gcp_project=env.get("GATEWAY_GCP_PROJECT") or None,
         )

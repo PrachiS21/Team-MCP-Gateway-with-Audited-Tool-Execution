@@ -140,3 +140,73 @@ def test_ensure_admin_promotes_and_reactivates_an_existing_user(auth):
     auth.set_active(u.id, False)
     user, _ = auth.ensure_admin("root@example.com")
     assert user.is_admin and user.active
+
+
+def test_ensure_admin_with_a_key_registers_it_and_never_issues_one(auth, db):
+    _, key = generate_key()
+    user, issued = auth.ensure_admin("root@example.com", key)
+    assert issued is None and auth.verify(key).id == user.id
+    _, again = auth.ensure_admin("root@example.com", key)  # a restart on the same database: nothing changes
+    assert again is None and len(auth.list_keys(user.id)) == 1
+    fresh = AuthService(f"sqlite:///{db.parent / 'fresh.db'}")  # a restart on an empty database (Cloud Run)
+    user2, issued2 = fresh.ensure_admin("root@example.com", key)
+    assert issued2 is None and fresh.verify(key).id == user2.id
+
+
+def test_a_revoked_admin_key_stays_revoked_after_a_restart(auth, caplog):
+    _, key = generate_key()
+    auth.ensure_admin("root@example.com", key)
+    auth.revoke_key(parse_key(key))
+    _, issued = auth.ensure_admin("root@example.com", key)
+    assert issued is None and auth.verify(key) is None
+    assert "stays revoked" in caplog.text and key not in caplog.text
+
+
+# -- keys made elsewhere (GATEWAY_ADMIN_KEY, seeded users) -----------------------
+
+def test_a_registered_key_verifies_stores_only_its_hash_and_can_be_registered_again(auth, db):
+    u = auth.create_user("cx@example.com")
+    _, key = generate_key()
+    info, created = auth.register_key(u.id, key, "seed")
+    assert created and info.key_id == parse_key(key) and auth.verify(key).id == u.id
+    info2, created2 = auth.register_key(u.id, key, "seed")
+    assert not created2 and info2.key_id == info.key_id
+    dump = " ".join(str(row) for row in sqlite3.connect(db).execute("select * from api_keys"))
+    assert key not in dump and hash_key(key) in dump
+
+
+def test_a_revoked_registered_key_is_not_brought_back(auth):
+    u = auth.create_user("cx@example.com")
+    _, key = generate_key()
+    auth.register_key(u.id, key, "seed")
+    auth.revoke_key(parse_key(key))
+    info, created = auth.register_key(u.id, key, "seed")
+    assert not created and info.revoked and auth.verify(key) is None
+
+
+def test_a_key_id_used_by_another_user_or_key_is_refused_without_echoing_the_key(auth):
+    a, b = auth.create_user("a@example.com"), auth.create_user("b@example.com")
+    _, key = generate_key()
+    auth.register_key(a.id, key, "seed")
+    forged = key[:-1] + ("0" if key[-1] != "0" else "1")  # same id, different secret
+    for user_id, k in ((b.id, key), (a.id, forged), (None, key)):
+        with pytest.raises(AuthError, match="already used") as e:
+            auth.check_registrable(k, user_id)
+        assert key not in str(e.value) and forged not in str(e.value)
+    with pytest.raises(AuthError):
+        auth.register_key(b.id, key, "seed")
+    assert auth.verify(key).id == a.id  # still a's
+
+
+@pytest.mark.parametrize("bad", ["", "not-a-key", "wmcp_short_abc"])
+def test_a_malformed_key_cannot_be_registered(auth, bad):
+    u = auth.create_user("cx@example.com")
+    with pytest.raises(AuthError, match=r"wmcp_<8 hex>"):
+        auth.register_key(u.id, bad, "seed")
+
+
+def test_set_role(auth):
+    u = auth.create_user("a@example.com")
+    assert auth.set_role(u.id, "admin").is_admin
+    with pytest.raises(AuthError, match="role must be one of"):
+        auth.set_role(u.id, "owner")

@@ -75,6 +75,15 @@ def test_all_overrides():
     assert (s.timezone, s.timeout, s.port, s.host) == ("Europe/London", 3.5, 9000, "127.0.0.1")
 
 
+@pytest.mark.parametrize("extra, port", [
+    ({"PORT": "8080"}, 8080),  # Cloud Run sets PORT
+    ({"PORT": "8080", "MCP_PORT": "9000"}, 9000),  # an explicit MCP_PORT still wins
+    ({"MCP_PORT": ""}, 8000),  # empty counts as unset
+])
+def test_port_comes_from_mcp_port_then_port(extra, port):
+    assert Settings.from_env({**ENV, **extra}).port == port
+
+
 @pytest.mark.parametrize("missing", ["WOO_BASE_URL", "WOO_CONSUMER_KEY", "WOO_CONSUMER_SECRET", "MCP_SERVER_TOKEN"])
 def test_each_required_variable_is_reported_by_name(missing):
     env = {k: v for k, v in ENV.items() if k != missing}

@@ -2,9 +2,13 @@
 
 record() raises if the write fails. Whether a failed audit write should fail the
 call (fail closed) or only be logged (fail open) is decided by the caller, not here.
+
+Each finished call and each admin event is also written as one structured log line
+(logger "gateway.audit", see logs.py), without emails or anything secret.
 """
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -12,6 +16,8 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from .models import AdminEventRow, AuditRow, Base
+
+_log = logging.getLogger("gateway.audit")
 
 OUTCOMES = ("started", "success", "tool_error", "error", "auth_failed", "denied")
 # "started" is the write-ahead row; a row that stays "started" means the process died mid-call.
@@ -54,6 +60,17 @@ def _event(r: AdminEventRow) -> AdminEvent:
     return AdminEvent(r.id, ts, r.actor, r.action, r.server_slug, json.loads(r.details or "{}"))
 
 
+def _log_call(r: AuditRow) -> None:
+    """One structured line per finished call: what Cloud Monitoring counts (log-based metrics), and the copy of the
+    audit trail that outlives this database. Ids only: no email, no arguments, nothing secret."""
+    _log.log(logging.INFO if r.outcome == "success" else logging.WARNING,
+             "%s call %s/%s %s in %d ms", r.source, r.server_slug or "-", r.tool or "-", r.outcome, r.duration_ms,
+             extra={"json_fields": {
+                 "event": "tool_call", "outcome": r.outcome, "source": r.source, "server": r.server_slug,
+                 "tool": r.tool, "duration_ms": r.duration_ms, "error_kind": r.error_kind,
+                 "user_id": r.user_id, "key_id": r.key_id, "audit_id": r.id}})
+
+
 def _entry(r: AuditRow) -> AuditEntry:
     ts = r.ts if r.ts.tzinfo else r.ts.replace(tzinfo=timezone.utc)  # SQLite drops tz info
     return AuditEntry(r.id, ts, r.user_id, r.user_email, r.key_id, r.server_id, r.server_slug,
@@ -82,6 +99,8 @@ class AuditLog:
         with self._sessions() as s:
             s.add(row)
             s.commit()
+        if outcome != "started":  # a started row is logged once finish() knows how it ended
+            _log_call(row)
         return _entry(row)
 
     def begin(self, **fields) -> AuditEntry:
@@ -99,6 +118,7 @@ class AuditLog:
                 raise AuditError(f"unknown audit entry {entry_id}")
             row.outcome, row.duration_ms, row.error_kind = outcome, max(0, int(duration_ms)), error_kind
             s.commit()
+        _log_call(row)
 
     def _filtered(self, stmt, user_id, server_slug, tool, outcome, since, until):
         if user_id is not None:
@@ -143,6 +163,9 @@ class AuditLog:
         with self._sessions() as s:
             s.add(row)
             s.commit()
+        _log.info("admin event %s%s", action, f" on {server_slug}" if server_slug else "", extra={"json_fields": {
+            "event": "admin_event", "action": action, "server": server_slug,
+            "actor": "user" if "@" in actor else actor}})  # "system", "system:seed", "cli:<name>"; emails stay in the DB
         return _event(row)
 
     def events(self, *, server_slug: str | None = None, action: str | None = None,

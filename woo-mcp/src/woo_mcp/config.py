@@ -17,7 +17,7 @@ class Settings:
     timezone: str = "Asia/Kolkata"  # STORE_TIMEZONE: IANA name; default is IST (UTC+05:30, no daylight saving)
     timeout: float = 10.0  # WOO_TIMEOUT, seconds per store request
     host: str = "0.0.0.0"  # MCP_HOST
-    port: int = 8000  # MCP_PORT
+    port: int = 8000  # MCP_PORT, else PORT (set by Cloud Run)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -35,9 +35,9 @@ class Settings:
             raise SystemExit(f"STORE_TIMEZONE {tz!r} is not a valid IANA time zone (e.g. Asia/Kolkata)") from None
         try:
             timeout = float(env.get("WOO_TIMEOUT", cls.timeout))
-            port = int(env.get("MCP_PORT", cls.port))
+            port = int(env.get("MCP_PORT") or env.get("PORT") or cls.port)
         except ValueError:
-            raise SystemExit("WOO_TIMEOUT must be a number and MCP_PORT an integer") from None
+            raise SystemExit("WOO_TIMEOUT must be a number and MCP_PORT (or PORT) an integer") from None
         return cls(base_url=base_url, consumer_key=env["WOO_CONSUMER_KEY"], consumer_secret=env["WOO_CONSUMER_SECRET"],
                    server_token=env["MCP_SERVER_TOKEN"], timezone=tz, timeout=timeout,
                    host=env.get("MCP_HOST", cls.host), port=port)

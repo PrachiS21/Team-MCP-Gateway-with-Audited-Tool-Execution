@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from gateway.audit.service import AuditLog
+from gateway.auth.keys import generate_key as generate_api_key, parse_key
+from gateway.auth.service import AuthService
 from gateway.cli import main as cli_main
 from gateway.config import Settings
 from gateway.incidents import IncidentLog
@@ -22,6 +24,7 @@ from tests.fixtures.fake_upstream import FakeUpstream
 KEY = generate_key()
 URL = "http://10.43.0.12:8000/mcp"  # an IP: a *.local hostname makes macOS wait seconds for multicast DNS
 SECRET_1, SECRET_2 = "TOKEN-ONE-s3cret", "TOKEN-TWO-r0tated"
+CX_KEY = generate_api_key()[1]
 
 
 def entry(**kw):
@@ -44,13 +47,14 @@ def env(tmp_path):
     e.registry = ServerRegistry(e.db, SecretBox(KEY), allow_loopback=True)
     e.audit = AuditLog(e.db)
     e.incidents = IncidentLog(e.incident_file)
-    e.vars = {"WOO_TOKEN": SECRET_1}
+    e.auth = AuthService(e.db)
+    e.vars = {"WOO_TOKEN": SECRET_1, "CX_KEY": CX_KEY, "BAD_KEY": "not-a-key"}
 
-    def write(*servers):
-        e.seed.write_text(json.dumps({"servers": list(servers)}))
+    def write(*servers, users=None):
+        e.seed.write_text(json.dumps({"servers": list(servers), **({"users": users} if users is not None else {})}))
 
     def run():
-        return apply_seed(e.seed, e.vars, e.registry, e.audit, e.incidents)
+        return apply_seed(e.seed, e.vars, e.registry, e.audit, e.incidents, auth=e.auth)
 
     e.write, e.run = write, run
     return e
@@ -249,6 +253,98 @@ def test_the_gateway_process_refuses_to_start_on_a_bad_seed(tmp_path):
     assert "refusing to start" in result.stderr and "MISSING_VAR" in result.stderr
 
 
+# -- seeded users: keys from a secret, for databases that start empty (Cloud Run) ------------------------------
+
+def cx(**kw):
+    base = {"email": "cx-agent@example.com", "role": "member", "key_env": "CX_KEY"}
+    base.update(kw)
+    return {k: v for k, v in base.items() if v is not None}
+
+
+def test_a_seeded_user_is_created_with_the_key_from_the_environment_and_audited_without_it(env, caplog):
+    env.write(entry(), users=[cx()])
+    with caplog.at_level(logging.INFO, logger="gateway"):
+        report = env.run()
+    user = env.auth.verify(CX_KEY)
+    assert (user.email, user.role) == ("cx-agent@example.com", "member")
+    assert report.users == {"cx-agent@example.com": "created"}
+    [event] = env.audit.events(action="user_created")
+    assert event.actor == "system:seed" and event.details["key_id"] == parse_key(CX_KEY)
+    everywhere = json.dumps([e.details for e in env.audit.events()]) + caplog.text + env.incident_file.read_text()
+    assert CX_KEY not in everywhere
+    assert "cx-agent@example.com" not in caplog.text  # emails stay in the database
+
+
+def test_a_restart_changes_nothing_but_is_audited(env):
+    env.write(entry(), users=[cx()])
+    env.run()
+    assert env.run().users == {"cx-agent@example.com": "unchanged"}
+    assert len(env.auth.list_keys(env.auth.verify(CX_KEY).id)) == 1
+    assert len(env.audit.events(action="user_unchanged")) == 1
+
+
+def test_a_changed_role_is_applied_and_recorded(env):
+    env.write(entry(), users=[cx()])
+    env.run()
+    env.write(entry(), users=[cx(role="admin")])
+    assert env.run().users == {"cx-agent@example.com": "updated"}
+    assert env.auth.verify(CX_KEY).is_admin
+    assert env.audit.events(action="user_updated")[0].details["changed"] == ["role"]
+
+
+def test_an_admins_deactivation_and_revocation_survive_a_restart(env):
+    env.write(entry(), users=[cx()])
+    env.run()
+    user = env.auth.verify(CX_KEY)
+    env.auth.set_active(user.id, False)
+    env.run()
+    assert env.auth.verify(CX_KEY) is None and not env.auth.get_user(user.id).active
+    env.auth.set_active(user.id, True)
+    env.auth.revoke_key(parse_key(CX_KEY))
+    env.run()
+    assert env.auth.verify(CX_KEY) is None
+    assert env.audit.events(action="user_unchanged")[0].details["key_revoked"] is True
+
+
+@pytest.mark.parametrize("users, fragment", [
+    ([{**cx(), "key": CX_KEY}], "must not be in the file"),
+    ([{**cx(), "api_key": CX_KEY}], "must not be in the file"),
+    ([{**cx(), "color": "red"}], "unknown key"),
+    ([cx(email=None)], "'email' is required"),
+    ([cx(email="nope")], "'email' is required"),
+    ([cx(role="owner")], "role must be one of"),
+    ([cx(key_env=None)], "'key_env' is required"),
+    ([cx(key_env="NOT_SET")], "NOT_SET is not set"),
+    ([cx(key_env="BAD_KEY")], "BAD_KEY does not hold a gateway API key"),
+    ([cx(), cx()], "duplicate user"),
+    ([cx(), cx(email="other@example.com")], "hold the same key"),
+    (["not an object"], "must be an object"),
+    ("oops", '"users" must be a list'),
+])
+def test_bad_users_are_refused_and_nothing_is_applied(env, users, fragment):
+    env.write(entry(), users=users)
+    with pytest.raises(SeedError, match=fragment) as e:
+        env.run()
+    assert CX_KEY not in str(e.value) and "not-a-key" not in str(e.value)
+    assert env.registry.list() == [] and env.auth.list_users() == []  # the server was not created either
+
+
+def test_a_key_already_used_by_another_user_stops_the_seed_before_anything_changes(env):
+    other = env.auth.create_user("someone@example.com")
+    env.auth.register_key(other.id, CX_KEY, "by hand")
+    env.write(entry(), users=[cx()])
+    with pytest.raises(SeedError, match="cx-agent@example.com.*already used") as e:
+        env.run()
+    assert CX_KEY not in str(e.value)
+    assert env.registry.list() == [] and env.auth.get_user_by_email("cx-agent@example.com") is None
+
+
+def test_a_users_section_needs_a_user_store(env):
+    env.write(entry(), users=[cx()])
+    with pytest.raises(SeedError, match="no user store"):
+        apply_seed(env.seed, env.vars, env.registry, env.audit, env.incidents)
+
+
 # -- gateway starts and restarts are audited -----------------------------------------------------------------------
 
 def settings_for(tmp_path, seed=None):
@@ -326,3 +422,16 @@ async def test_the_events_cli_command_shows_starts_and_what_changed(tmp_path):
     out = io.StringIO()
     cli_main(["events", "--server", "nope"], settings=settings, out=out, err=io.StringIO(), stdin=io.StringIO(), env={})
     assert out.getvalue().strip() == "(none)"
+
+
+async def test_the_gateway_accepts_a_seeded_key_on_every_fresh_database(tmp_path):
+    """Cloud Run with SQLite: each restart starts from an empty database; the seeded key must work every time."""
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"servers": [entry()], "users": [cx()]}))
+    for run in ("first", "after-restart"):
+        (tmp_path / run).mkdir()
+        gw = create_gateway(settings_for(tmp_path / run, seed), env={"WOO_TOKEN": SECRET_1, "CX_KEY": CX_KEY})
+        try:
+            assert gw.auth.verify(CX_KEY).email == "cx-agent@example.com"
+        finally:
+            await gw.manager.close()

@@ -22,6 +22,7 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
 from fastmcp.tools import Tool, ToolResult
 from mcp.types import TextContent
+from starlette.middleware import Middleware as ASGIMiddleware  # not fastmcp's Middleware (imported above)
 from starlette.responses import JSONResponse
 
 from gateway.api import register_api
@@ -34,6 +35,7 @@ from gateway.config import Settings
 from gateway.incidents import IncidentLog
 from gateway.jobs import UndoJobStore
 from gateway.locks import KeyedLocks
+from gateway.logs import TraceMiddleware
 from gateway.mcp.manager import UpstreamManager
 from gateway.registry.crypto import SecretBox
 from gateway.registry.registry import ServerRegistry
@@ -120,7 +122,8 @@ class Gateway:
     api_routes: list  # (method, path, access) of every /api route
 
     def http_app(self):
-        return self.mcp.http_app(path="/mcp", stateless_http=True)
+        # TraceMiddleware: lines logged while a request is handled carry its trace id (see logs.py)
+        return self.mcp.http_app(path="/mcp", stateless_http=True, middleware=[ASGIMiddleware(TraceMiddleware)])
 
 
 def create_gateway(settings: Settings, compensations: CompensationRegistry | None = None,
@@ -139,7 +142,8 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
 
     started = {"seed_file": settings.seed_file is not None}
     if settings.seed_file is not None:  # raises SeedError on a bad file: the gateway then refuses to start
-        report = apply_seed(settings.seed_file, os.environ if env is None else env, registry, audit, incidents)
+        report = apply_seed(settings.seed_file, os.environ if env is None else env, registry, audit, incidents,
+                            auth=auth)
         started.update(created=[c.slug for c in report.changes if c.action == "created"],
                        updated=[c.slug for c in report.changes if c.action == "updated"],
                        unchanged=report.unchanged)
@@ -179,10 +183,14 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
     mcp = FastMCP("gateway", auth=GatewayKeyVerifier(auth, audit), middleware=[GatewayMiddleware(service)],
                   lifespan=lifespan)
 
+    # Each probe has two paths. Kubernetes uses the "z" ones; Cloud Run's front end reserves paths ending in "z"
+    # (they answer Google's own 404 from outside), so Cloud Run probes and uptime checks use /health and /ready.
+    @mcp.custom_route("/health", methods=["GET"])
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_request):  # liveness: the process is up
         return JSONResponse({"status": "ok"})
 
+    @mcp.custom_route("/ready", methods=["GET"])
     @mcp.custom_route("/readyz", methods=["GET"])
     async def readyz(_request):  # readiness: the database answers
         try:

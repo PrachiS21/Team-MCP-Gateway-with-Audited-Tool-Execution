@@ -5,6 +5,7 @@ import re
 import pytest
 from fastmcp import Client
 
+from gateway.auth.keys import parse_key
 from gateway.auth.service import AuthService
 from gateway.cli import main
 from gateway.config import Settings
@@ -274,3 +275,13 @@ def test_a_broken_audit_store_does_not_fail_a_command_that_succeeded(cli, monkey
     monkeypatch.setattr(AuditLog, "record_event", lambda self, **kw: (_ for _ in ()).throw(RuntimeError("audit db down")))
     code, out, err = cli("create-user", "a@example.com")
     assert code == 0 and "created" in out and "could not be recorded" in err
+
+
+def test_generate_key_string_prints_a_new_valid_key_and_needs_no_settings(monkeypatch):
+    monkeypatch.delenv("GATEWAY_SECRET_KEY", raising=False)  # like generate-secret-key: no database, no secret
+    keys = []
+    for _ in range(2):
+        out = io.StringIO()
+        assert main(["generate-key-string"], out=out, err=io.StringIO(), env={}) == 0
+        keys.append(out.getvalue().strip())
+    assert all(parse_key(k) for k in keys) and keys[0] != keys[1]

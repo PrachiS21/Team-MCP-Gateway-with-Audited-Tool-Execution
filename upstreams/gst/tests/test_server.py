@@ -7,6 +7,7 @@ import uvicorn
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
 
+from gst_mcp.__main__ import port_from_env
 from gst_mcp.server import build_server, create_app
 
 TOKEN = "gateway-shared-token-xyz"
@@ -110,3 +111,12 @@ def test_it_refuses_to_start_without_a_token_or_with_a_bad_state(monkeypatch):
         create_app()
     with pytest.raises(ValueError):
         build_server("")
+
+
+@pytest.mark.parametrize("env, port", [
+    ({}, 8000),
+    ({"PORT": "8080"}, 8080),  # Cloud Run sets PORT
+    ({"PORT": "8080", "MCP_PORT": "9000"}, 9000),  # an explicit MCP_PORT still wins
+])
+def test_port_comes_from_mcp_port_then_port(env, port):
+    assert port_from_env(env) == port
