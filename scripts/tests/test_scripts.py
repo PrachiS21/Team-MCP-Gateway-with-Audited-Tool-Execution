@@ -390,7 +390,9 @@ def test_build_images_restarts_nothing_when_not_installed_or_on_another_cluster(
 GCP = SCRIPTS.parent / "deploy" / "gcp"
 LLM_KEY = "gsk_" + "Q" * 40  # one repeated character: the repository's secret scan treats these as placeholders
 CK, CS = "ck_" + "1" * 40, "cs_" + "2" * 40
-DEPLOY = {"WOO_BASE_URL": "https://shop.example.com", "ADMIN_EMAIL": "owner@example.com"}
+WOO_ON_CLOUD_RUN = {"WOO_BASE_URL": "https://shop.example.com", "ADMIN_EMAIL": "owner@example.com"}
+WOO_ON_HP = {"WOO_MCP_URL": "https://woo-mcp.tail1234.ts.net/mcp", "ADMIN_EMAIL": "owner@example.com"}
+HP_TOKEN = "ab" * 24  # the HP's woo-mcp token: 48 hex characters, as bootstrap-secrets.sh makes it
 SECRET_NAMES = ["gateway-env", "woo-mcp-token", "gst-mcp-token", "woo-consumer-key", "woo-consumer-secret"]
 
 
@@ -481,7 +483,7 @@ def test_an_llm_key_added_later_keeps_the_other_values_and_leaves_one_billed_ver
 ])
 def test_gcp_secrets_refuses_a_bad_value_before_creating_anything(env, stdin, says):
     r = env.run("gcp-secrets.sh", stdin=stdin)
-    assert r.returncode != 0 and says in r.stderr and "nothing was created" in r.stderr
+    assert r.returncode != 0 and says in r.stderr and "nothing was changed" in r.stderr
     assert not gcloud_calls(env, "secrets create")
     for value in stdin.splitlines():  # every typed value, good or bad
         assert value not in r.stdout + r.stderr
@@ -489,20 +491,23 @@ def test_gcp_secrets_refuses_a_bad_value_before_creating_anything(env, stdin, sa
 
 @pytest.mark.parametrize("script, args", [("gcp-secrets.sh", []), ("gcp-deploy.sh", []), ("gcp-teardown.sh", ["--yes"])])
 def test_gcp_scripts_refuse_to_run_without_a_project(env, script, args):
-    r = env.run(script, *args, STUB_GCP_PROJECT="", **DEPLOY)
+    r = env.run(script, *args, STUB_GCP_PROJECT="", **WOO_ON_CLOUD_RUN)
     assert r.returncode != 0 and "GCP_PROJECT" in r.stderr
     assert not [c for c in env.calls("gcloud") if " create" in c or " delete" in c or " deploy" in c]
 
 
 def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_for_the_free_tier(env):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     calls = env.calls("gcloud")
-    [build] = gcloud_calls(env, "builds submit")
+    builds = gcloud_calls(env, "builds submit")
+    root = SCRIPTS.parent
+    assert [re.search(r"--config=(\S+)", b).group(1) for b in builds] == [
+        f"{root}/deploy/gcp/cloudbuild.yaml", f"{root}/deploy/gcp/cloudbuild-woo-mcp.yaml"]
     deploys = gcloud_calls(env, "run deploy")
     assert [d.split()[3] for d in deploys] == ["woo-mcp", "gst", "gateway"]  # the gateway's seed needs their URLs
-    assert calls.index(build) < calls.index(deploys[0])
+    assert calls.index(builds[-1]) < calls.index(deploys[0])
     for d in deploys:
         name = d.split()[3]
         for flag in ("--min-instances=0", "--cpu-throttling", "--allow-unauthenticated", "--region=us-central1",
@@ -523,7 +528,7 @@ def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_
 
 def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     text = (env.state / "gcloud" / "vars" / "gateway.yaml").read_text()
     gw = yaml.safe_load(text)
@@ -541,7 +546,7 @@ def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env
 
 def test_each_service_account_reads_only_its_own_secrets_and_has_no_project_role(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     own = {"gateway": ["gateway-env", "woo-mcp-token", "gst-mcp-token"],
            "woo-mcp": ["woo-mcp-token", "woo-consumer-key", "woo-consumer-secret"], "gst": ["gst-mcp-token"]}
     expected = sorted(f"{secret} serviceAccount:{sa}-run@demo-proj.iam.gserviceaccount.com "
@@ -552,7 +557,7 @@ def test_each_service_account_reads_only_its_own_secrets_and_has_no_project_role
 
 def test_gcp_deploy_sets_up_the_cost_guards(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     root = SCRIPTS.parent
     [policy] = gcloud_calls(env, "artifacts repositories set-cleanup-policies")
     assert f"--policy={root}/deploy/gcp/cleanup-policy.json" in policy and "--no-dry-run" in policy
@@ -560,13 +565,62 @@ def test_gcp_deploy_sets_up_the_cost_guards(env):
     assert "gs://demo-proj-build-source" in bucket and "--location=us-central1" in bucket
     [lifecycle] = gcloud_calls(env, "storage buckets update")
     assert f"--lifecycle-file={root}/deploy/gcp/build-source-lifecycle.json" in lifecycle
-    [build] = gcloud_calls(env, "builds submit")
-    assert f"--config={root}/deploy/gcp/cloudbuild.yaml" in build
-    assert "--gcs-source-staging-dir=gs://demo-proj-build-source/source" in build
+    builds = gcloud_calls(env, "builds submit")
+    assert builds and all("--gcs-source-staging-dir=gs://demo-proj-build-source/source" in b for b in builds)
     [budget] = gcloud_calls(env, "billing budgets create")
     for part in ("--budget-amount=1 ", "--filter-projects=projects/demo-proj", "--threshold-rule=percent=0.5",
                  "--threshold-rule=percent=1.0", "--display-name=demo-proj free-tier guard"):
         assert part in budget + " ", part
+
+
+# -- woo-mcp on the HP (WOO_MCP_URL): published with Tailscale Funnel, nothing of it in Google Cloud ---------------
+
+def hp_ready(env):
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{HP_TOKEN}\n", WOO_MCP_URL=WOO_ON_HP["WOO_MCP_URL"])
+    assert r.returncode == 0, r.stderr
+    env.log.write_text("")
+    return r
+
+
+def test_with_woo_mcp_on_the_hp_the_secrets_are_three_and_the_token_is_the_hps(env):
+    r = hp_ready(env)
+    assert gcp_secret(env, "woo-mcp-token") == HP_TOKEN  # typed, not made: a new token would never match the HP's
+    assert sorted(p.name for p in (env.state / "gcloud" / "secrets").iterdir()) == \
+           ["gateway-env", "gst-mcp-token", "woo-mcp-token"]  # the WooCommerce keys stay on the HP
+    assert HP_TOKEN not in r.stdout + r.stderr
+
+
+def test_a_token_pasted_still_in_base64_is_refused_before_anything_is_created(env):
+    import base64
+    pasted = base64.b64encode(HP_TOKEN.encode()).decode()  # kubectl's output without `| base64 -d`
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{pasted}\n", WOO_MCP_URL=WOO_ON_HP["WOO_MCP_URL"])
+    assert r.returncode != 0 and "base64 -d" in r.stderr and pasted not in r.stdout + r.stderr
+    assert not gcloud_calls(env, "secrets create")
+
+
+def test_with_woo_mcp_on_the_hp_nothing_of_it_is_built_or_deployed_and_the_seed_points_at_the_hp(env):
+    hp_ready(env)
+    r = env.run("gcp-deploy.sh", **WOO_ON_HP)
+    assert r.returncode == 0, r.stderr
+    [build] = gcloud_calls(env, "builds submit")
+    assert f"--config={SCRIPTS.parent}/deploy/gcp/cloudbuild.yaml " in build + " "
+    assert [d.split()[3] for d in gcloud_calls(env, "run deploy")] == ["gst", "gateway"]
+    assert not [c for c in env.calls("gcloud") if "woo-mcp-run" in c or "woo-consumer" in c]
+    gw = yaml.safe_load((env.state / "gcloud" / "vars" / "gateway.yaml").read_text())
+    entries = load_seed(gw["GATEWAY_SEED_JSON"], {"WOO_MCP_TOKEN": HP_TOKEN, "GST_MCP_TOKEN": "t2"})
+    assert [(e.slug, e.url, e.credential) for e in entries] == [
+        ("woo", "https://woo-mcp.tail1234.ts.net/mcp", HP_TOKEN), ("gst", "https://gst-abc123-uc.a.run.app/mcp", "t2")]
+    assert sorted((env.state / "gcloud" / "iam.txt").read_text().splitlines()) == sorted(
+        f"{s} serviceAccount:{sa}-run@demo-proj.iam.gserviceaccount.com roles/secretmanager.secretAccessor"
+        for sa, s in [("gateway", "gateway-env"), ("gateway", "woo-mcp-token"), ("gateway", "gst-mcp-token"),
+                      ("gst", "gst-mcp-token")])
+    assert HP_TOKEN not in env.log.read_text() + r.stdout + r.stderr
+
+
+def test_with_woo_mcp_on_cloud_run_the_deploy_still_needs_the_store_keys(env):
+    hp_ready(env)  # secrets made for the HP: no WooCommerce keys in Google Cloud
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
+    assert r.returncode != 0 and "woo-consumer-key" in r.stderr and not gcloud_calls(env, "run deploy")
 
 
 def test_the_files_in_deploy_gcp_hold_what_the_scripts_promise():
@@ -576,20 +630,23 @@ def test_the_files_in_deploy_gcp_hold_what_the_scripts_promise():
     assert json.loads((GCP / "build-source-lifecycle.json").read_text()) == \
            {"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}
     build = yaml.safe_load((GCP / "cloudbuild.yaml").read_text())
-    # the same folders build-images.sh builds for Kubernetes, all three at once
+    woo = yaml.safe_load((GCP / "cloudbuild-woo-mcp.yaml").read_text())
+    # the same folders build-images.sh builds for Kubernetes; woo-mcp on its own, built only for Cloud Run
     assert [(s["id"], s["args"][-1], s["waitFor"]) for s in build["steps"]] == [
-        ("gateway", "backend", ["-"]), ("woo-mcp", "woo-mcp", ["-"]), ("gst-mcp", "upstreams/gst", ["-"])]
-    assert build["images"] == [f"${{_REPO}}/{s['id']}:${{_TAG}}" for s in build["steps"]]
-    assert build["options"] == {"logging": "CLOUD_LOGGING_ONLY"}  # and no machineType: the free minutes need the default
+        ("gateway", "backend", ["-"]), ("gst-mcp", "upstreams/gst", ["-"])]
+    assert [(s["id"], s["args"][-1]) for s in woo["steps"]] == [("woo-mcp", "woo-mcp")]
+    for config in (build, woo):
+        assert config["images"] == [f"${{_REPO}}/{s['id']}:${{_TAG}}" for s in config["steps"]]
+        assert config["options"] == {"logging": "CLOUD_LOGGING_ONLY"}  # no machineType: the free minutes need the default
     ignore = (SCRIPTS.parent / ".gcloudignore").read_text().splitlines()
     assert "#!include:.gitignore" in ignore and ".git" in ignore  # secrets and private notes never leave the Mac
 
 
 def test_gcp_deploy_run_again_creates_nothing_new_and_deploys_new_revisions(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     env.log.write_text("")
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     assert not [c for c in env.calls("gcloud") if re.match(r"gcloud \S+ \S+ create", c)]
     assert len(gcloud_calls(env, "run deploy")) == 3 and "already exists" in r.stdout  # the budget
@@ -597,19 +654,21 @@ def test_gcp_deploy_run_again_creates_nothing_new_and_deploys_new_revisions(env)
 
 def test_gcp_deploy_only_warns_when_the_budget_alert_cannot_be_made(env):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", STUB_BUDGETS_FAIL="1", **DEPLOY)
+    r = env.run("gcp-deploy.sh", STUB_BUDGETS_FAIL="1", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0 and "could not set up the budget alert" in r.stderr
     assert len(gcloud_calls(env, "run deploy")) == 3
 
 
 def test_gcp_deploy_marks_images_built_from_uncommitted_changes(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", STUB_GIT_STATUS=" M backend/src/gateway/seed.py\n", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", STUB_GIT_STATUS=" M backend/src/gateway/seed.py\n", **WOO_ON_CLOUD_RUN).returncode == 0
     assert all(re.search(r":\d{8}-\d{6}-abc1234-dirty ", d) for d in gcloud_calls(env, "run deploy"))
 
 
 @pytest.mark.parametrize("change, says", [
-    ({"WOO_BASE_URL": None}, "set WOO_BASE_URL"),
+    ({"WOO_BASE_URL": None}, "say where woo-mcp runs"),
+    ({"WOO_MCP_URL": "https://woo-mcp.tail1234.ts.net/mcp"}, "not both"),
+    ({"WOO_BASE_URL": None, "WOO_MCP_URL": "http://woo-mcp.tail1234.ts.net/mcp"}, "WOO_MCP_URL must start with https://"),
     ({"WOO_BASE_URL": "http://shop.example.com"}, "must start with https://"),
     ({"WOO_BASE_URL": "https://shop.example.com,EVIL=1"}, "WOO_BASE_URL"),
     ({"ADMIN_EMAIL": None}, "set ADMIN_EMAIL"),
@@ -620,13 +679,13 @@ def test_gcp_deploy_marks_images_built_from_uncommitted_changes(env):
 ])
 def test_gcp_deploy_stops_before_changing_anything_when_a_setting_is_wrong(env, change, says):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", **{**DEPLOY, **change})
+    r = env.run("gcp-deploy.sh", **{**WOO_ON_CLOUD_RUN, **change})
     assert r.returncode != 0 and says in r.stderr
     assert not [c for c in env.calls("gcloud") if re.match(r"gcloud (services|builds|run|\S+ \S+ create)", c)]
 
 
 def test_gcp_deploy_stops_when_a_secret_is_missing_and_says_how_to_make_it(env):
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode != 0 and "gcp-secrets.sh" in r.stderr
     assert not gcloud_calls(env, "builds submit") and not gcloud_calls(env, "run deploy")
 
@@ -639,7 +698,7 @@ def test_gcp_teardown_deletes_nothing_unless_delete_is_typed(env, answer):
 
 def test_gcp_teardown_deletes_the_services_and_keeps_the_secrets(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     r = env.run("gcp-teardown.sh", stdin="delete\n")
     assert r.returncode == 0, r.stderr
     assert [c.split()[4] for c in gcloud_calls(env, "run services delete")] == ["gateway", "woo-mcp", "gst"]
@@ -648,3 +707,42 @@ def test_gcp_teardown_deletes_the_services_and_keeps_the_secrets(env):
     r = env.run("gcp-teardown.sh", "--yes")  # nothing left to delete: fine
     assert r.returncode == 0 and r.stdout.count("not found (fine)") == 3
     assert env.run("gcp-teardown.sh", "--force").returncode != 0
+
+
+# -- tailscale-operator.sh (on the HP) ----------------------------------------------------------------------------
+
+TS_ID, TS_SECRET = "kAbCdEf123", "tskey-client-kAbCdEf123-" + "Z" * 30
+
+
+def test_tailscale_operator_stores_the_oauth_client_as_a_secret_then_installs_the_chart_without_it(env):
+    r = env.run("tailscale-operator.sh", stdin=f"{TS_ID}\n{TS_SECRET}\n")
+    assert r.returncode == 0, r.stderr
+    assert env.secret("tailscale", "operator-oauth") == {"client_id": TS_ID, "client_secret": TS_SECRET}
+    calls = env.calls()
+    install = "helm upgrade --install tailscale-operator tailscale/tailscale-operator -n tailscale --wait"
+    assert install in calls  # no credentials given to helm: the chart reads tailscale/operator-oauth
+    assert calls.index(install) > max(i for i, c in enumerate(calls) if "create secret generic operator-oauth" in c)
+    assert "helm repo add tailscale https://pkgs.tailscale.com/helmcharts --force-update" in calls
+    assert TS_SECRET not in env.log.read_text() + r.stdout + r.stderr  # never on a command line, never shown
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_tailscale_operator_keeps_an_existing_secret_and_pins_a_version_when_asked(env):
+    env.add_secret("tailscale", "operator-oauth", client_id="old", client_secret="tskey-client-old")
+    r = env.run("tailscale-operator.sh", stdin="", TAILSCALE_OPERATOR_VERSION="1.80.0")
+    assert r.returncode == 0 and "already exists" in r.stdout
+    assert env.secret("tailscale", "operator-oauth")["client_id"] == "old"
+    assert any(c.endswith("-n tailscale --wait --version 1.80.0") for c in env.calls("helm"))
+
+
+@pytest.mark.parametrize("stdin, context, says", [
+    (f"{TS_ID}\nnot-a-client-secret\n", "k3d-wc", "tskey-client-"),
+    ("\n\n", "k3d-wc", "OAuth client id"),
+    (f"{TS_ID}\n{TS_SECRET}\n", "production", "production"),
+])
+def test_tailscale_operator_refuses_without_storing_or_installing_anything(env, stdin, context, says):
+    r = env.run("tailscale-operator.sh", stdin=stdin, STUB_CONTEXT=context)
+    assert r.returncode != 0 and says in r.stderr
+    assert env.secret("tailscale", "operator-oauth") is None
+    assert not [c for c in env.calls("helm") if "upgrade" in c]
+    assert "not-a-client-secret" not in r.stdout + r.stderr

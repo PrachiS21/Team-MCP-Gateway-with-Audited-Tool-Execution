@@ -1,4 +1,5 @@
-# The storefront and wp-admin, on one stable host name. Only WordPress is exposed; the database and the MCP server have no Ingress.
+# The storefront and wp-admin, on one stable host name. Only WordPress is exposed here; the database has no Ingress, and
+# the MCP server gets one only when publicMcp is on (public-mcp.yaml: Tailscale Funnel, woo-mcp alone).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

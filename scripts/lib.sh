@@ -13,6 +13,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 log() { printf '[%s] %s\n' "$(basename "$0" .sh)" "$*"; }
 die() { log "error: $*" >&2; exit 1; }
 
+# ask <prompt>: one line, typed with echo off at a terminal, else read from stdin. Printed on stdout, for $(...).
+# A script that uses it also runs `stty echo` in its EXIT trap, in case it is interrupted at the prompt.
+ask() {
+  if [ -t 0 ]; then
+    printf '%s (input hidden): ' "$1" >&2
+    stty -echo; read -r line || line=""; stty echo; printf '\n' >&2
+  else
+    read -r line || line=""
+  fi
+  printf '%s' "$line"
+}
+
+# looks_like <what> <value> <extended regex>: stops unless the value matches, and never shows it (it is a secret)
+looks_like() {
+  printf '%s\n' "$2" | grep -Eqx "$3" || die "that does not look like $1; nothing was changed"
+}
+
 need() {
   for c in "$@"; do
     command -v "$c" >/dev/null 2>&1 || die "$c is not installed (see scripts/README.md)"

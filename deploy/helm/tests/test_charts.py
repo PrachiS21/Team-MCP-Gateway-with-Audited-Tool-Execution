@@ -210,6 +210,49 @@ def test_the_mcp_server_accepts_connections_only_from_the_gateway(rendered):
     assert [p["port"] for rule in policy["ingress"] for p in rule["ports"]] == [8000]
 
 
+# -- publicMcp: woo-mcp on the internet through Tailscale Funnel, for a gateway on Cloud Run ---------------------------
+
+@pytest.mark.parametrize("env", ENVS)
+def test_nothing_is_published_through_tailscale_unless_asked(rendered, env):
+    docs = rendered["store", env]
+    assert not [i for i in kinds(docs, "Ingress") if i["spec"].get("ingressClassName") == "tailscale"]
+    assert "tailscale" not in json.dumps(named(docs, "NetworkPolicy", "woo-mcp"))
+
+
+def test_publishing_woo_mcp_exposes_that_service_alone_whatever_host_a_visitor_sends():
+    docs = render("store", "local", "publicMcp.enabled=true")
+    ingress = named(docs, "Ingress", "woo-mcp-public")
+    assert ingress["spec"]["ingressClassName"] == "tailscale"
+    assert ingress["metadata"]["annotations"] == {"tailscale.com/funnel": "true"}
+    # no host rules, one default backend: a forged Host header cannot pick another site
+    assert "rules" not in ingress["spec"]
+    assert ingress["spec"]["defaultBackend"] == {"service": {"name": "woo-mcp", "port": {"number": 8000}}}
+    assert ingress["spec"]["tls"] == [{"hosts": ["woo-mcp"]}]
+    service = named(docs, "Service", "woo-mcp")
+    assert [p["port"] for p in service["spec"]["ports"]] == [8000]
+
+
+def test_publishing_woo_mcp_admits_only_the_tailscale_proxy_for_it_and_changes_no_other_rule(rendered):
+    docs = render("store", "local", "publicMcp.enabled=true")
+    policy = named(docs, "NetworkPolicy", "woo-mcp")["spec"]
+    [rule] = policy["ingress"]
+    gateway, proxy = rule["from"]
+    assert gateway == named(rendered["store", "local"], "NetworkPolicy", "woo-mcp")["spec"]["ingress"][0]["from"][0]
+    # Both selectors in ONE entry: a pod with these labels IN that namespace (the labels the operator puts on the
+    # proxy it runs for an Ingress: managed, and the Ingress's name and namespace)
+    assert proxy == {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "tailscale"}},
+                     "podSelector": {"matchLabels": {"tailscale.com/managed": "true",
+                                                     "tailscale.com/parent-resource": "woo-mcp-public",
+                                                     "tailscale.com/parent-resource-ns": "store-main"}}}
+    assert [p["port"] for p in rule["ports"]] == [8000] and policy["egress"] == \
+           named(rendered["store", "local"], "NetworkPolicy", "woo-mcp")["spec"]["egress"]  # still only WordPress
+    others = lambda d: sorted((p["metadata"]["name"], json.dumps(p["spec"], sort_keys=True))
+                              for p in kinds(d, "NetworkPolicy") if p["metadata"]["name"] != "woo-mcp")
+    assert others(docs) == others(rendered["store", "local"])
+    storefront = [i for i in kinds(docs, "Ingress") if i["metadata"]["name"] != "woo-mcp-public"]
+    assert storefront == kinds(rendered["store", "local"], "Ingress")
+
+
 def test_the_database_accepts_connections_only_from_wordpress_and_the_setup_job(rendered):
     policy = named(rendered["store", "local"], "NetworkPolicy", "mariadb")["spec"]
     allowed = {f["podSelector"]["matchLabels"]["app.kubernetes.io/name"] for r in policy["ingress"] for f in r["from"]}

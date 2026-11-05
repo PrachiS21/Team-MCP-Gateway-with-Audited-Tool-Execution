@@ -5,14 +5,20 @@
 #
 #   gateway-env          the gateway's own secrets as NAME=value lines, mounted as ONE file (GATEWAY_SECRETS_FILE):
 #                        GATEWAY_SECRET_KEY, GATEWAY_ADMIN_KEY, GATEWAY_LLM_API_KEY (the Groq key; optional)
-#   woo-mcp-token        woo-mcp's MCP_SERVER_TOKEN; the gateway gets the same secret as WOO_MCP_TOKEN
+#   woo-mcp-token        the token woo-mcp accepts; the gateway gets it as WOO_MCP_TOKEN
 #   gst-mcp-token        gst's MCP_SERVER_TOKEN; the gateway gets it as GST_MCP_TOKEN
+# and, only when woo-mcp runs on Cloud Run:
 #   woo-consumer-key     the store's WooCommerce REST API key (ck_...): made in the store, asked for here
 #   woo-consumer-secret  its secret (cs_...)
 #
+# Where woo-mcp runs decides two of them. Run this and gcp-deploy.sh with the same WOO_MCP_URL:
+#   WOO_MCP_URL set (woo-mcp on the HP, published with Tailscale Funnel): woo-mcp-token must be the token the HP's
+#     woo-mcp already has, so it is asked for, not made; the WooCommerce keys never leave the HP. 3 secrets.
+#   WOO_MCP_URL unset (woo-mcp on Cloud Run): woo-mcp-token is made here and the WooCommerce keys are asked for. 5.
+#
 # Why gateway-env is one secret: Secret Manager bills every secret version that is not destroyed, beyond the first six.
-# A secret per value would be 7 now and 9 once the CX and ADK keys exist. A value added to gateway-env later (the LLM
-# key skipped at first, say) goes into a NEW version that also holds the old values; the older versions are then
+# A secret per value would pass six once the CX and ADK keys exist. A value added to gateway-env later (the LLM key
+# skipped at first, say) goes into a NEW version that also holds the old values; the older versions are then
 # destroyed. Destroying cannot be undone, which is fine: the new version holds everything they did.
 #
 # Read the admin key when you need it (this script never prints it):
@@ -29,22 +35,6 @@ umask 077
 
 hex() { openssl rand -hex "$1"; }
 fernet() { openssl rand -base64 32 | tr '+/' '-_'; }  # a Fernet key: 32 random bytes in URL-safe base64
-
-# ask <prompt>: one line, typed with echo off at a terminal, else read from stdin. Printed on stdout, for $(...).
-ask() {
-  if [ -t 0 ]; then
-    printf '%s (input hidden): ' "$1" >&2
-    stty -echo; read -r line || line=""; stty echo; printf '\n' >&2
-  else
-    read -r line || line=""
-  fi
-  printf '%s' "$line"
-}
-
-# looks_like <what> <value> <extended regex>: like valid(), but never shows the value (it is a secret)
-looks_like() {
-  printf '%s\n' "$2" | grep -Eqx "$3" || die "that does not look like $1; nothing was created"
-}
 
 # create <name> <file>: kept in GCP_REGION only, so each version is billed for one location
 create() {
@@ -91,15 +81,26 @@ if ! grep -q '^GATEWAY_LLM_API_KEY=' "$WORK/gateway.env"; then
     if [ "$GATEWAY_ENV" = kept ]; then GATEWAY_ENV=changed; fi
   fi
 fi
-if ! secret_exists woo-consumer-key; then
-  ck="$(ask 'WooCommerce consumer key (ck_..., made in the store: WooCommerce > Settings > Advanced > REST API)')"
-  looks_like "a WooCommerce consumer key (ck_ and 40 hex characters)" "$ck" 'ck_[0-9a-f]{40}'
-  printf '%s' "$ck" > "$WORK/woo-consumer-key"
-fi
-if ! secret_exists woo-consumer-secret; then
-  cs="$(ask 'WooCommerce consumer secret (cs_...)')"
-  looks_like "a WooCommerce consumer secret (cs_ and 40 hex characters)" "$cs" 'cs_[0-9a-f]{40}'
-  printf '%s' "$cs" > "$WORK/woo-consumer-secret"
+if [ -n "$WOO_MCP_URL" ]; then
+  if secret_exists woo-mcp-token; then
+    log "note: woo-mcp-token is kept as it is, and must match the token the HP's woo-mcp has"
+  else
+    token="$(ask "the HP's woo-mcp token (on the HP: kubectl -n $STORE_NS get secret store-mcp -o jsonpath='{.data.MCP_SERVER_TOKEN}' | base64 -d)")"
+    looks_like "the woo-mcp token (48 hex characters; kubectl prints it in base64: did you leave out base64 -d?)" \
+      "$token" '[0-9a-f]{48}'
+    printf '%s' "$token" > "$WORK/woo-mcp-token"
+  fi
+else
+  if ! secret_exists woo-consumer-key; then
+    ck="$(ask 'WooCommerce consumer key (ck_..., made in the store: WooCommerce > Settings > Advanced > REST API)')"
+    looks_like "a WooCommerce consumer key (ck_ and 40 hex characters)" "$ck" 'ck_[0-9a-f]{40}'
+    printf '%s' "$ck" > "$WORK/woo-consumer-key"
+  fi
+  if ! secret_exists woo-consumer-secret; then
+    cs="$(ask 'WooCommerce consumer secret (cs_...)')"
+    looks_like "a WooCommerce consumer secret (cs_ and 40 hex characters)" "$cs" 'cs_[0-9a-f]{40}'
+    printf '%s' "$cs" > "$WORK/woo-consumer-secret"
+  fi
 fi
 
 # 2. Create what is missing.
@@ -112,14 +113,18 @@ case "$GATEWAY_ENV" in
   *) log "gateway-env already exists; leaving it alone" ;;
 esac
 for name in woo-mcp-token gst-mcp-token; do
-  if secret_exists "$name"; then
+  if [ -f "$WORK/$name" ]; then  # typed above
+    create "$name" "$WORK/$name"
+  elif secret_exists "$name"; then
     log "$name already exists; leaving it alone"
   else
     printf '%s' "$(hex 24)" > "$WORK/$name"  # printf '%s': no newline at the end, it would become part of the token
     create "$name" "$WORK/$name"
   fi
 done
-for name in woo-consumer-key woo-consumer-secret; do
-  if [ -f "$WORK/$name" ]; then create "$name" "$WORK/$name"; else log "$name already exists; leaving it alone"; fi
-done
-log "done. Next: WOO_BASE_URL=https://<store> ADMIN_EMAIL=<you> scripts/gcp-deploy.sh"
+if [ -z "$WOO_MCP_URL" ]; then
+  for name in $GCP_STORE_SECRETS; do
+    if [ -f "$WORK/$name" ]; then create "$name" "$WORK/$name"; else log "$name already exists; leaving it alone"; fi
+  done
+fi
+log "done. Next, with the same WOO_MCP_URL: scripts/gcp-deploy.sh (see its header for the settings)"

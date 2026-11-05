@@ -2,5 +2,7 @@
 # Replace 192.168.1.11 with the HP's LAN address if it changes.
 host: shop.192.168.1.11.sslip.io
 scheme: http
+publicMcp:
+  enabled: false    # true = woo-mcp at https://woo-mcp.<tailnet>.ts.net for the gateway on Cloud Run (scripts/README.md)
 images:
   mcp: { repository: woo-mcp, tag: dev, pullPolicy: IfNotPresent }   # built on the HP, imported into k3d

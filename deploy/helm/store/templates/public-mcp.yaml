@@ -1,0 +1,23 @@
+{{- if .Values.publicMcp.enabled }}
+# woo-mcp on the internet through Tailscale Funnel (values: publicMcp), for a gateway outside the cluster.
+# Tailscale's operator runs a proxy pod for this Ingress, wired to the woo-mcp Service alone: there are no host rules,
+# only a default backend, so whatever Host header a visitor sends, nothing else in the cluster is reachable this way.
+# (A Funnel pointed at Traefik would be different: Funnel hands the visitor's own Host header on, and Traefik picks the
+# site by Host, so the storefront and the dashboard would be one forged header away.)
+# HTTPS ends in that proxy. woo-mcp then checks its own token, and the woo-mcp NetworkPolicy admits this proxy only.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: woo-mcp-public
+  labels:
+    {{- include "store.labels" . | nindent 4 }}
+    app.kubernetes.io/name: woo-mcp
+  annotations:
+    tailscale.com/funnel: "true"   # public internet, not only the tailnet
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service: { name: woo-mcp, port: { number: 8000 } }
+  tls:
+    - hosts: [{{ required "set publicMcp.hostname" .Values.publicMcp.hostname | quote }}]
+{{- end }}

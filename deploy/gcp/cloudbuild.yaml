@@ -1,15 +1,12 @@
 # Builds the Cloud Run images in parallel and pushes them to Artifact Registry. Run by scripts/gcp-deploy.sh:
 #   gcloud builds submit --config=deploy/gcp/cloudbuild.yaml --substitutions=_REPO=<region>-docker.pkg.dev/<project>/<repo>,_TAG=<tag>
 # The images are the same ones Kubernetes runs (same Dockerfiles); Cloud Build machines are amd64, like Cloud Run.
+# woo-mcp has its own file (cloudbuild-woo-mcp.yaml): it is built only when it runs on Cloud Run, not on the HP.
 steps:
   - id: gateway
     name: gcr.io/cloud-builders/docker
     args: [build, -t, "${_REPO}/gateway:${_TAG}", backend]
-    waitFor: ["-"]                  # "-" = start at once: the three builds run side by side
-  - id: woo-mcp
-    name: gcr.io/cloud-builders/docker
-    args: [build, -t, "${_REPO}/woo-mcp:${_TAG}", woo-mcp]
-    waitFor: ["-"]
+    waitFor: ["-"]                  # "-" = start at once: the builds run side by side
   - id: gst-mcp
     name: gcr.io/cloud-builders/docker
     args: [build, -t, "${_REPO}/gst-mcp:${_TAG}", upstreams/gst]
@@ -17,7 +14,6 @@ steps:
 
 images:                             # pushed once every step has succeeded
   - "${_REPO}/gateway:${_TAG}"
-  - "${_REPO}/woo-mcp:${_TAG}"
   - "${_REPO}/gst-mcp:${_TAG}"
 
 options:
