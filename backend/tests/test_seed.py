@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -351,6 +352,30 @@ def settings_for(tmp_path, seed=None):
     return Settings(secret_key=KEY, db_url=f"sqlite:///{tmp_path / 'gw.db'}",
                     jobs_db_url=f"sqlite:///{tmp_path / 'jobs.db'}", allow_loopback=True, seed_file=seed,
                     worker_interval=3600, sync_interval=3600)
+
+
+def test_the_seed_as_text_gets_every_check_a_file_gets(env):
+    """GATEWAY_SEED_JSON (Cloud Run): plain config, which is fine only because secrets are refused here too."""
+    def apply(text):
+        return apply_seed(text, env.vars, env.registry, env.audit, env.incidents, auth=env.auth)
+
+    with pytest.raises(SeedError, match="GATEWAY_SEED_JSON is not valid JSON"):
+        apply("{not json")
+    with pytest.raises(SeedError, match="'token' must not be in the file") as e:
+        apply(json.dumps({"servers": [entry(token="s3cret-inline")]}))
+    assert "s3cret-inline" not in str(e.value) and env.registry.list() == []
+    report = apply(json.dumps({"servers": [entry()]}, indent=2))
+    assert [(c.slug, c.action) for c in report.changes] == [("woo", "created")]
+    assert env.registry.upstream_config(env.registry.get_by_slug("woo").id).credential == SECRET_1
+
+
+async def test_a_gateway_applies_a_seed_given_as_text_at_startup(tmp_path):
+    settings = replace(settings_for(tmp_path), seed_json=json.dumps({"servers": [entry()]}))
+    gw = create_gateway(settings, env={"WOO_TOKEN": SECRET_1})
+    await gw.manager.close()
+    assert [s.slug for s in gw.registry.list()] == ["woo"]
+    [start] = gw.audit.events(action="gateway_started")
+    assert start.details["seed_file"] is True and start.details["created"] == ["woo"]
 
 
 async def test_every_gateway_start_is_audited_even_without_a_seed_file(tmp_path):

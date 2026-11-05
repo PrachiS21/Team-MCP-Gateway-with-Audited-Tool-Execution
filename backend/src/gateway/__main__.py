@@ -5,13 +5,14 @@ import sys
 import uvicorn
 
 from gateway.auth.service import AuthError
-from gateway.config import Settings
+from gateway.config import Settings, load_secrets_file
 from gateway.logs import setup_logging
 from gateway.seed import SeedError
 from gateway.server import create_gateway
 
 
 def main() -> None:
+    load_secrets_file()  # first: it may hold GATEWAY_SECRET_KEY, the admin key, and keys the seed file names
     settings = Settings.from_env()
     setup_logging(settings.log_format, settings.gcp_project)
     try:

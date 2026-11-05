@@ -1,4 +1,5 @@
-"""Register servers from a config file at startup (Helm mounts it from a ConfigMap).
+"""Register servers from a config file at startup (Helm mounts it from a ConfigMap; on Cloud Run the same JSON comes
+as text in GATEWAY_SEED_JSON).
 
 The SLUG is the match key. For each entry: no server with that slug -> create it; one exists -> update it
 to match the file (name, URL, credential, timeout). An admin's enabled/disabled switch is never touched,
@@ -68,20 +69,22 @@ class SeedUser:
     key: str = field(repr=False)  # resolved from the environment; never printed
 
 
-def _read(path: Path) -> dict:
+def _read(source: Path | str) -> dict:
+    """`source` is the seed file, or the seed itself as JSON text (GATEWAY_SEED_JSON)."""
+    where = f"seed file {source}" if isinstance(source, Path) else "GATEWAY_SEED_JSON"
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(source.read_text() if isinstance(source, Path) else source)
     except FileNotFoundError:
-        raise SeedError(f"seed file {path} does not exist") from None
+        raise SeedError(f"{where} does not exist") from None
     except (OSError, ValueError) as exc:
-        raise SeedError(f"seed file {path} is not valid JSON: {exc}") from None
+        raise SeedError(f"{where} is not valid JSON: {exc}") from None
     if not isinstance(raw, dict) or not isinstance(raw.get("servers"), list):
         raise SeedError('seed file must look like {"servers": [ ... ], "users": [ ... ]} ("users" is optional)')
     return raw
 
 
-def load_seed(path: Path, env: Mapping[str, str]) -> list[SeedEntry]:
-    return _servers(_read(path), env)
+def load_seed(source: Path | str, env: Mapping[str, str]) -> list[SeedEntry]:
+    return _servers(_read(source), env)
 
 
 def _servers(raw: dict, env: Mapping[str, str]) -> list[SeedEntry]:
@@ -185,9 +188,10 @@ def _record(audit: AuditLog, action: str, slug: str | None, details: dict) -> No
         log.exception("could not record the admin event %s", action)
 
 
-def apply_seed(path: Path, env: Mapping[str, str], registry: ServerRegistry, audit: AuditLog,
+def apply_seed(source: Path | str, env: Mapping[str, str], registry: ServerRegistry, audit: AuditLog,
                incidents: IncidentLog, auth: AuthService | None = None) -> SeedReport:
-    raw = _read(path)
+    """`source`: the seed file's path, or the seed as JSON text."""
+    raw = _read(source)
     entries, users = _servers(raw, env), _users(raw, env)
     if users and auth is None:
         raise SeedError("the seed file lists users, but this caller gave no user store")

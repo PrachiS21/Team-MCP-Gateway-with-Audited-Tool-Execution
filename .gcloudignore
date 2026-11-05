@@ -1,0 +1,12 @@
+# What `gcloud builds submit` (scripts/gcp-deploy.sh) leaves out of the upload to Cloud Build.
+# Everything git ignores stays behind too: .env files, keys, databases, private notes, .venv, node_modules.
+.gcloudignore
+.git
+#!include:.gitignore
+
+# The images are built from backend/, woo-mcp/, upstreams/gst/ (and later frontend/); these are not needed.
+docs/
+deploy/
+scripts/
+tests/
+upstreams/everything/
