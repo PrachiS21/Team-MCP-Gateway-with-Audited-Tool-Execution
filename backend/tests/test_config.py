@@ -32,3 +32,14 @@ def test_an_unknown_log_format_stops_the_gateway_with_a_clear_message(monkeypatc
     monkeypatch.setenv("GATEWAY_LOG_FORMAT", "JSON ")
     with pytest.raises(SystemExit, match="GATEWAY_LOG_FORMAT must be one of text, json"):
         Settings.from_env()
+
+
+def test_an_admin_key_needs_an_admin_email_and_never_shows_in_repr(monkeypatch):
+    monkeypatch.setenv("GATEWAY_SECRET_KEY", "test-key")
+    monkeypatch.delenv("GATEWAY_ADMIN_EMAIL", raising=False)
+    monkeypatch.setenv("GATEWAY_ADMIN_KEY", "wmcp_secret-value")
+    with pytest.raises(SystemExit, match="GATEWAY_ADMIN_EMAIL is not"):
+        Settings.from_env()
+    monkeypatch.setenv("GATEWAY_ADMIN_EMAIL", "root@example.com")
+    settings = Settings.from_env()
+    assert settings.admin_key == "wmcp_secret-value" and "secret-value" not in repr(settings)

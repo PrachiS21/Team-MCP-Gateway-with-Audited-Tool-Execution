@@ -1,7 +1,8 @@
 """Users and API keys. The only code that turns a key into a user.
 
-Plaintext keys exist only in the return value of issue_key(); the database and
-every read method hold hashes or metadata. Revocation takes effect on the very
+Plaintext keys exist only in the return value of issue_key() (or, for keys made
+elsewhere, in the argument to register_key()); the database and every read method
+hold hashes or metadata. Revocation takes effect on the very
 next verify() because verify() reads the database each time.
 
 Dashboard sessions: logging in with an API key creates a session whose random token goes in an HttpOnly cookie
@@ -10,6 +11,7 @@ the key or deactivating the user also ends the dashboard login on the next reque
 """
 
 import hashlib
+import logging
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -21,6 +23,8 @@ from sqlalchemy.orm import sessionmaker
 
 from .keys import generate_key, hash_key, hashes_match, parse_key
 from .models import ApiKeyRow, Base, SessionRow, UserRow
+
+log = logging.getLogger("gateway")
 
 ROLES = ("admin", "member")
 _LAST_USED_RESOLUTION = timedelta(minutes=1)  # don't write to the DB on every request
@@ -123,6 +127,15 @@ class AuthService:
         with self._sessions() as s:
             return [_user(r) for r in s.scalars(select(UserRow).order_by(UserRow.created_at))]
 
+    def set_role(self, user_id: str, role: str) -> User:
+        if role not in ROLES:
+            raise AuthError(f"role must be one of {ROLES}")
+        with self._sessions() as s:
+            row = self._user_row(s, user_id)
+            row.role = role
+            s.commit()
+            return _user(row)
+
     def set_active(self, user_id: str, active: bool) -> User:
         """Deactivating a user makes all of their keys stop working immediately."""
         with self._sessions() as s:
@@ -153,6 +166,33 @@ class AuthService:
             s.add(ApiKeyRow(id=key_id, user_id=user_id, key_hash=hash_key(key), name=name, created_at=_now()))
             s.commit()
         return IssuedKey(key_id, key, name)
+
+    def check_registrable(self, key: str, user_id: str | None) -> str:
+        """The key's id if register_key(user_id, key) can succeed (user_id None: a user not created yet).
+        Raises AuthError otherwise. Messages never contain the key."""
+        key_id = parse_key(key)
+        if key_id is None:
+            raise AuthError("not a valid gateway API key (expected wmcp_<8 hex>_<64 hex>)")
+        with self._sessions() as s:
+            row = s.get(ApiKeyRow, key_id)
+        if row is not None and (row.user_id != user_id or not hashes_match(row.key_hash, hash_key(key))):
+            raise AuthError(f"key id {key_id} is already used by another key or user")
+        return key_id
+
+    def register_key(self, user_id: str, key: str, name: str) -> tuple[KeyInfo, bool]:
+        """Store a key made elsewhere (kept in a secret manager, e.g. GATEWAY_ADMIN_KEY): only its hash, as for
+        issued keys. Returns (info, created). Safe to repeat at every start. A revoked key stays revoked: a restart
+        must never quietly undo an admin's revocation."""
+        key_id = self.check_registrable(key, user_id)
+        with self._sessions() as s:
+            row = s.get(ApiKeyRow, key_id)
+            if row is not None:
+                return _info(row), False
+            self._user_row(s, user_id)  # unknown user -> AuthError
+            row = ApiKeyRow(id=key_id, user_id=user_id, key_hash=hash_key(key), name=name, created_at=_now())
+            s.add(row)
+            s.commit()
+            return _info(row), True
 
     def revoke_key(self, key_id: str) -> KeyInfo:
         """Idempotent: revoking an already revoked key keeps the original time."""
@@ -240,9 +280,12 @@ class AuthService:
 
     # -- bootstrap --------------------------------------------------------
 
-    def ensure_admin(self, email: str) -> tuple[User, IssuedKey | None]:
-        """Make sure an active admin with this email exists. A key is issued (and
-        returned) only when the user has no usable key yet, so restarts don't
+    def ensure_admin(self, email: str, key: str | None = None) -> tuple[User, IssuedKey | None]:
+        """Make sure an active admin with this email exists.
+
+        With `key` (GATEWAY_ADMIN_KEY, from a secret manager): that key is registered and nothing is ever issued,
+        so nothing secret is printed, and a fresh database (a Cloud Run restart) accepts the same key again.
+        Without it: a key is issued (and returned) only when the user has no usable key yet, so restarts don't
         mint a new key every time."""
         user = self.get_user_by_email(email) or self.create_user(email, "admin")
         if user.role != "admin" or not user.active:
@@ -251,6 +294,12 @@ class AuthService:
                 row.role, row.active = "admin", True
                 s.commit()
                 user = _user(row)
+        if key is not None:
+            info, _ = self.register_key(user.id, key, "bootstrap (GATEWAY_ADMIN_KEY)")
+            if info.revoked:
+                log.warning("GATEWAY_ADMIN_KEY (key id %s) was revoked and stays revoked: put a new key in the "
+                            "secret to log in as the first admin", info.key_id)
+            return user, None
         if any(not k.revoked for k in self.list_keys(user.id)):
             return user, None
         return user, self.issue_key(user.id, "bootstrap")

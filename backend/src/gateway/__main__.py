@@ -4,6 +4,7 @@ import sys
 
 import uvicorn
 
+from gateway.auth.service import AuthError
 from gateway.config import Settings
 from gateway.logs import setup_logging
 from gateway.seed import SeedError
@@ -19,7 +20,10 @@ def main() -> None:
         raise SystemExit(f"refusing to start: {exc}") from None
 
     if settings.admin_email:
-        admin, issued = gw.auth.ensure_admin(settings.admin_email)
+        try:  # with GATEWAY_ADMIN_KEY nothing is ever issued, so nothing secret is printed (or reaches the logs)
+            admin, issued = gw.auth.ensure_admin(settings.admin_email, settings.admin_key)
+        except AuthError as exc:
+            raise SystemExit(f"refusing to start: GATEWAY_ADMIN_KEY: {exc}") from None
         if issued is not None:  # only when the admin has no usable key yet; shown once, never stored
             print(f"\nFirst admin: {admin.email}\nAPI key (shown once, store it safely):\n  {issued.key}\n",
                   file=sys.stderr, flush=True)

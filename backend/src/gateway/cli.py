@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Callable, TextIO
 
 from gateway.audit.service import AuditError, AuditLog
+from gateway.auth.keys import generate_key as generate_api_key
 from gateway.auth.service import AuthError, AuthService, User
 from gateway.config import Settings
 from gateway.registry.crypto import SecretBox, SecretBoxError, generate_key
@@ -212,6 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
         return sub.add_parser(name, help=help_)
 
     cmd("generate-secret-key", "print a new GATEWAY_SECRET_KEY")
+    cmd("generate-key-string", "print a new API key for a secret (GATEWAY_ADMIN_KEY, a seeded user's key_env); "
+                               "nothing is stored")
 
     c = cmd("create-user", "create a user"); c.add_argument("email"); c.add_argument("--role", choices=["admin", "member"], default="member")
     cmd("list-users", "list users")
@@ -254,6 +257,9 @@ def main(argv: list[str] | None = None, *, settings: Settings | None = None, out
     args = build_parser().parse_args(argv)
     if args.command == "generate-secret-key":
         print(generate_key(), file=out)
+        return 0
+    if args.command == "generate-key-string":  # e.g. | gcloud secrets create gateway-admin-key --data-file=-
+        print(generate_api_key()[1], file=out)
         return 0
     try:
         cli = Cli(settings or Settings.from_env(), out, stdin, env, prompt, actor, err)

@@ -142,7 +142,8 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
 
     started = {"seed_file": settings.seed_file is not None}
     if settings.seed_file is not None:  # raises SeedError on a bad file: the gateway then refuses to start
-        report = apply_seed(settings.seed_file, os.environ if env is None else env, registry, audit, incidents)
+        report = apply_seed(settings.seed_file, os.environ if env is None else env, registry, audit, incidents,
+                            auth=auth)
         started.update(created=[c.slug for c in report.changes if c.action == "created"],
                        updated=[c.slug for c in report.changes if c.action == "updated"],
                        unchanged=report.unchanged)

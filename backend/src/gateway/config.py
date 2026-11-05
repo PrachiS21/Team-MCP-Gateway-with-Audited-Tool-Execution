@@ -14,6 +14,7 @@ class Settings:
     db_url: str = "sqlite:///gateway.db"  # GATEWAY_DB_URL: registry, users, keys, audit log
     jobs_db_url: str = "sqlite:///gateway_jobs.db"  # GATEWAY_JOBS_DB_URL: undo jobs (separate file on purpose)
     admin_email: str | None = None  # GATEWAY_ADMIN_EMAIL: first admin, created at startup
+    admin_key: str | None = field(default=None, repr=False)  # GATEWAY_ADMIN_KEY: that admin's key, from a secret manager
     allow_loopback: bool = False  # GATEWAY_ALLOW_LOOPBACK=1: dev only, lets upstream URLs point at localhost
     host: str = "0.0.0.0"  # GATEWAY_HOST
     port: int = 8000  # GATEWAY_PORT, else PORT (set by Cloud Run)
@@ -38,6 +39,8 @@ class Settings:
         if not key:
             raise SystemExit("GATEWAY_SECRET_KEY is not set. Generate one with: "
                              "python -c 'from gateway.registry.crypto import generate_key; print(generate_key())'")
+        if env.get("GATEWAY_ADMIN_KEY") and not env.get("GATEWAY_ADMIN_EMAIL"):
+            raise SystemExit("GATEWAY_ADMIN_KEY is set but GATEWAY_ADMIN_EMAIL is not: the key needs an admin to belong to")
         log_format = env.get("GATEWAY_LOG_FORMAT") or cls.log_format
         if log_format not in LOG_FORMATS:
             raise SystemExit(f"GATEWAY_LOG_FORMAT must be one of {', '.join(LOG_FORMATS)}")
@@ -46,6 +49,7 @@ class Settings:
             db_url=env.get("GATEWAY_DB_URL", cls.db_url),
             jobs_db_url=env.get("GATEWAY_JOBS_DB_URL", cls.jobs_db_url),
             admin_email=env.get("GATEWAY_ADMIN_EMAIL") or None,
+            admin_key=env.get("GATEWAY_ADMIN_KEY") or None,
             allow_loopback=env.get("GATEWAY_ALLOW_LOOPBACK", "") in ("1", "true", "yes"),
             host=env.get("GATEWAY_HOST", cls.host),
             port=int(env.get("GATEWAY_PORT") or env.get("PORT") or cls.port),
