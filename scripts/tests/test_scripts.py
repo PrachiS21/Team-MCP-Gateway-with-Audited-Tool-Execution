@@ -6,6 +6,7 @@ What this proves: the scripts make the right calls, in the right order, with the
 secrets off command lines and out of output. What it cannot prove: that the real tools behave as the stubs do.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -13,11 +14,16 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from cryptography.fernet import Fernet
+
+from gateway.auth.keys import parse_key
+from gateway.config import load_secrets_file
+from gateway.seed import load_seed
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 STUB = Path(__file__).with_name("stub.py")
-TOOLS = ["kubectl", "docker", "k3d", "helm", "rsync", "ip", "hostname", "curl", "claude"]
+TOOLS = ["kubectl", "docker", "k3d", "helm", "rsync", "ip", "hostname", "curl", "claude", "gcloud", "git"]
 IP_LINE = "1.1.1.1 via 192.168.1.1 dev wlp2s0 src 192.168.1.11 uid 1000"
 
 
@@ -375,3 +381,270 @@ def test_build_images_restarts_the_running_deployments_so_the_new_image_is_used(
 def test_build_images_restarts_nothing_when_not_installed_or_on_another_cluster(env, extra):
     assert env.run("build-images.sh", **extra).returncode == 0
     assert not [c for c in env.calls("kubectl") if "rollout restart" in c]
+
+
+# -- Cloud Run: gcp-secrets.sh, gcp-deploy.sh, gcp-teardown.sh ----------------------------------------------------
+# The gcloud stub keeps a small Google Cloud under state/gcloud (see stub.py). What the scripts produce is checked with
+# the gateway's own code where it can be: its secrets-file loader and its seed loader.
+
+GCP = SCRIPTS.parent / "deploy" / "gcp"
+LLM_KEY = "gsk_" + "Q" * 40  # one repeated character: the repository's secret scan treats these as placeholders
+CK, CS = "ck_" + "1" * 40, "cs_" + "2" * 40
+DEPLOY = {"WOO_BASE_URL": "https://shop.example.com", "ADMIN_EMAIL": "owner@example.com"}
+SECRET_NAMES = ["gateway-env", "woo-mcp-token", "gst-mcp-token", "woo-consumer-key", "woo-consumer-secret"]
+
+
+def gcp_versions(env, name):
+    """(live, destroyed) version numbers of a secret."""
+    folder = env.state / "gcloud" / "secrets" / name
+    numbers = sorted(int(p.name) for p in folder.iterdir() if p.name.isdigit())
+    destroyed = [n for n in numbers if (folder / f"{n}.destroyed").exists()]
+    return [n for n in numbers if n not in destroyed], destroyed
+
+
+def gcp_secret(env, name):
+    live, _ = gcp_versions(env, name)
+    return (env.state / "gcloud" / "secrets" / name / str(live[-1])).read_text()
+
+
+def gateway_env(env):
+    """gateway-env, read by the gateway's own loader (GATEWAY_SECRETS_FILE)."""
+    f = env.tmp / "gateway.env"
+    f.write_text(gcp_secret(env, "gateway-env"))
+    values = {"GATEWAY_SECRETS_FILE": str(f)}
+    load_secrets_file(values)
+    del values["GATEWAY_SECRETS_FILE"]
+    return values
+
+
+def every_gcp_secret_value(env):
+    return [*gateway_env(env).values(), *(gcp_secret(env, n) for n in SECRET_NAMES[1:])]
+
+
+def gcp_ready(env):
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{CK}\n{CS}\n")
+    assert r.returncode == 0, r.stderr
+    env.log.write_text("")
+
+
+def gcloud_calls(env, prefix):
+    return [c for c in env.calls("gcloud") if c.startswith(f"gcloud {prefix}")]
+
+
+def test_gcp_secrets_makes_five_values_in_one_region_in_the_shapes_the_services_need(env):
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{CK}\n{CS}\n")
+    assert r.returncode == 0, r.stderr
+    gw = gateway_env(env)
+    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY"}
+    Fernet(gw["GATEWAY_SECRET_KEY"].encode())  # raises if it is not a valid key for the gateway's encryption
+    assert parse_key(gw["GATEWAY_ADMIN_KEY"]) is not None and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY
+    woo, gst = gcp_secret(env, "woo-mcp-token"), gcp_secret(env, "gst-mcp-token")
+    assert re.fullmatch(r"[0-9a-f]{48}", woo) and re.fullmatch(r"[0-9a-f]{48}", gst) and woo != gst  # no "\n" at the end
+    assert gcp_secret(env, "woo-consumer-key") == CK and gcp_secret(env, "woo-consumer-secret") == CS
+    creates = gcloud_calls(env, "secrets create")
+    assert [c.split()[3] for c in creates] == SECRET_NAMES  # five values: inside Secret Manager's free six
+    assert all("--replication-policy=user-managed --locations=us-central1" in c for c in creates)  # one location each
+
+
+def test_gcp_secrets_never_shows_a_value_on_a_command_line_or_in_its_output(env):
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{CK}\n{CS}\n")
+    seen = env.log.read_text() + r.stdout + r.stderr
+    for value in every_gcp_secret_value(env):
+        assert value not in seen
+    assert list(env.tmpdir.iterdir()) == []  # its temporary files are gone
+
+
+def test_gcp_secrets_is_safe_to_run_again_and_changes_nothing(env):
+    gcp_ready(env)
+    before = every_gcp_secret_value(env)
+    r = env.run("gcp-secrets.sh", stdin="")
+    assert r.returncode == 0, r.stderr
+    assert every_gcp_secret_value(env) == before and r.stdout.count("already exists") == 5
+    assert not gcloud_calls(env, "secrets create") and not gcloud_calls(env, "secrets versions add")
+
+
+def test_an_llm_key_added_later_keeps_the_other_values_and_leaves_one_billed_version(env):
+    assert env.run("gcp-secrets.sh", stdin=f"\n{CK}\n{CS}\n").returncode == 0  # Enter: chat off for now
+    first = gateway_env(env)
+    assert "GATEWAY_LLM_API_KEY" not in first
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n")
+    assert r.returncode == 0, r.stderr
+    assert gateway_env(env) == {**first, "GATEWAY_LLM_API_KEY": LLM_KEY}  # the admin key and secret key did not change
+    assert gcp_versions(env, "gateway-env") == ([2], [1])  # the old version is destroyed: only one is billed
+    assert LLM_KEY not in env.log.read_text() + r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("stdin, says", [
+    (f"not a key!\n{CK}\n{CS}\n", "an API key"),
+    (f"{LLM_KEY}\nck_tooshort\n{CS}\n", "consumer key"),
+    (f"{LLM_KEY}\n{CK}\n{CK}\n", "consumer secret"),  # the key pasted twice
+])
+def test_gcp_secrets_refuses_a_bad_value_before_creating_anything(env, stdin, says):
+    r = env.run("gcp-secrets.sh", stdin=stdin)
+    assert r.returncode != 0 and says in r.stderr and "nothing was created" in r.stderr
+    assert not gcloud_calls(env, "secrets create")
+    for value in stdin.splitlines():  # every typed value, good or bad
+        assert value not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("script, args", [("gcp-secrets.sh", []), ("gcp-deploy.sh", []), ("gcp-teardown.sh", ["--yes"])])
+def test_gcp_scripts_refuse_to_run_without_a_project(env, script, args):
+    r = env.run(script, *args, STUB_GCP_PROJECT="", **DEPLOY)
+    assert r.returncode != 0 and "GCP_PROJECT" in r.stderr
+    assert not [c for c in env.calls("gcloud") if " create" in c or " delete" in c or " deploy" in c]
+
+
+def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_for_the_free_tier(env):
+    gcp_ready(env)
+    r = env.run("gcp-deploy.sh", **DEPLOY)
+    assert r.returncode == 0, r.stderr
+    calls = env.calls("gcloud")
+    [build] = gcloud_calls(env, "builds submit")
+    deploys = gcloud_calls(env, "run deploy")
+    assert [d.split()[3] for d in deploys] == ["woo-mcp", "gst", "gateway"]  # the gateway's seed needs their URLs
+    assert calls.index(build) < calls.index(deploys[0])
+    for d in deploys:
+        name = d.split()[3]
+        for flag in ("--min-instances=0", "--cpu-throttling", "--allow-unauthenticated", "--region=us-central1",
+                     "--port=8080", f"--service-account={name}-run@demo-proj.iam.gserviceaccount.com"):
+            assert flag in d, (name, flag)
+        assert "--no-cpu-throttling" not in d  # that is instance billing: about $40 a month for an always-on gateway
+        image = "gst-mcp" if name == "gst" else name
+        assert re.search(rf"--image=us-central1-docker\.pkg\.dev/demo-proj/mcp/{image}:\d{{8}}-\d{{6}}-abc1234 ", d)
+    woo, gst, gw = deploys
+    assert "--max-instances=2" in woo and "--max-instances=2" in gst
+    assert "--max-instances=1" in gw  # one instance = one database
+    assert "WOO_BASE_URL=https://shop.example.com" in woo and "WOO_CONSUMER_SECRET=woo-consumer-secret:latest" in woo
+    assert "MCP_SERVER_TOKEN=gst-mcp-token:latest" in gst and "STORE_STATE=MH" in gst
+    assert "/secrets/gateway/env=gateway-env:latest" in gw and "WOO_MCP_TOKEN=woo-mcp-token:latest" in gw
+    assert "woo-consumer" not in gw  # only woo-mcp can read the store's keys
+    assert "--startup-probe=httpGet.path=/ready," in gw
+
+
+def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env):
+    gcp_ready(env)
+    r = env.run("gcp-deploy.sh", **DEPLOY)
+    assert r.returncode == 0, r.stderr
+    text = (env.state / "gcloud" / "vars" / "gateway.yaml").read_text()
+    gw = yaml.safe_load(text)
+    assert gw["GATEWAY_SECRETS_FILE"] == "/secrets/gateway/env" and gw["GATEWAY_ADMIN_EMAIL"] == "owner@example.com"
+    assert gw["GATEWAY_LOG_FORMAT"] == "json" and gw["GATEWAY_GCP_PROJECT"] == "demo-proj"
+    assert gw["GATEWAY_COOKIE_SECURE"] == "1" and gw["GATEWAY_LLM_MODEL"] == "openai/gpt-oss-120b"
+    entries = load_seed(gw["GATEWAY_SEED_JSON"], {"WOO_MCP_TOKEN": "t1", "GST_MCP_TOKEN": "t2"})  # the gateway's loader
+    assert [(e.slug, e.url, e.credential) for e in entries] == [
+        ("woo", "https://woo-mcp-abc123-uc.a.run.app/mcp", "t1"), ("gst", "https://gst-abc123-uc.a.run.app/mcp", "t2")]
+    seen = text + env.log.read_text() + r.stdout + r.stderr
+    for value in every_gcp_secret_value(env):
+        assert value not in seen
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_each_service_account_reads_only_its_own_secrets_and_has_no_project_role(env):
+    gcp_ready(env)
+    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    own = {"gateway": ["gateway-env", "woo-mcp-token", "gst-mcp-token"],
+           "woo-mcp": ["woo-mcp-token", "woo-consumer-key", "woo-consumer-secret"], "gst": ["gst-mcp-token"]}
+    expected = sorted(f"{secret} serviceAccount:{sa}-run@demo-proj.iam.gserviceaccount.com "
+                      f"roles/secretmanager.secretAccessor" for sa, secrets in own.items() for secret in secrets)
+    assert sorted((env.state / "gcloud" / "iam.txt").read_text().splitlines()) == expected
+    assert not gcloud_calls(env, "projects add-iam-policy-binding")
+
+
+def test_gcp_deploy_sets_up_the_cost_guards(env):
+    gcp_ready(env)
+    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    root = SCRIPTS.parent
+    [policy] = gcloud_calls(env, "artifacts repositories set-cleanup-policies")
+    assert f"--policy={root}/deploy/gcp/cleanup-policy.json" in policy and "--no-dry-run" in policy
+    [bucket] = gcloud_calls(env, "storage buckets create")
+    assert "gs://demo-proj-build-source" in bucket and "--location=us-central1" in bucket
+    [lifecycle] = gcloud_calls(env, "storage buckets update")
+    assert f"--lifecycle-file={root}/deploy/gcp/build-source-lifecycle.json" in lifecycle
+    [build] = gcloud_calls(env, "builds submit")
+    assert f"--config={root}/deploy/gcp/cloudbuild.yaml" in build
+    assert "--gcs-source-staging-dir=gs://demo-proj-build-source/source" in build
+    [budget] = gcloud_calls(env, "billing budgets create")
+    for part in ("--budget-amount=1 ", "--filter-projects=projects/demo-proj", "--threshold-rule=percent=0.5",
+                 "--threshold-rule=percent=1.0", "--display-name=demo-proj free-tier guard"):
+        assert part in budget + " ", part
+
+
+def test_the_files_in_deploy_gcp_hold_what_the_scripts_promise():
+    keep, delete = json.loads((GCP / "cleanup-policy.json").read_text())
+    assert keep["action"]["type"] == "Keep" and keep["mostRecentVersions"]["keepCount"] == 2
+    assert delete["action"]["type"] == "Delete" and delete["condition"] == {"tagState": "any"}
+    assert json.loads((GCP / "build-source-lifecycle.json").read_text()) == \
+           {"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}
+    build = yaml.safe_load((GCP / "cloudbuild.yaml").read_text())
+    # the same folders build-images.sh builds for Kubernetes, all three at once
+    assert [(s["id"], s["args"][-1], s["waitFor"]) for s in build["steps"]] == [
+        ("gateway", "backend", ["-"]), ("woo-mcp", "woo-mcp", ["-"]), ("gst-mcp", "upstreams/gst", ["-"])]
+    assert build["images"] == [f"${{_REPO}}/{s['id']}:${{_TAG}}" for s in build["steps"]]
+    assert build["options"] == {"logging": "CLOUD_LOGGING_ONLY"}  # and no machineType: the free minutes need the default
+    ignore = (SCRIPTS.parent / ".gcloudignore").read_text().splitlines()
+    assert "#!include:.gitignore" in ignore and ".git" in ignore  # secrets and private notes never leave the Mac
+
+
+def test_gcp_deploy_run_again_creates_nothing_new_and_deploys_new_revisions(env):
+    gcp_ready(env)
+    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    env.log.write_text("")
+    r = env.run("gcp-deploy.sh", **DEPLOY)
+    assert r.returncode == 0, r.stderr
+    assert not [c for c in env.calls("gcloud") if re.match(r"gcloud \S+ \S+ create", c)]
+    assert len(gcloud_calls(env, "run deploy")) == 3 and "already exists" in r.stdout  # the budget
+
+
+def test_gcp_deploy_only_warns_when_the_budget_alert_cannot_be_made(env):
+    gcp_ready(env)
+    r = env.run("gcp-deploy.sh", STUB_BUDGETS_FAIL="1", **DEPLOY)
+    assert r.returncode == 0 and "could not set up the budget alert" in r.stderr
+    assert len(gcloud_calls(env, "run deploy")) == 3
+
+
+def test_gcp_deploy_marks_images_built_from_uncommitted_changes(env):
+    gcp_ready(env)
+    assert env.run("gcp-deploy.sh", STUB_GIT_STATUS=" M backend/src/gateway/seed.py\n", **DEPLOY).returncode == 0
+    assert all(re.search(r":\d{8}-\d{6}-abc1234-dirty ", d) for d in gcloud_calls(env, "run deploy"))
+
+
+@pytest.mark.parametrize("change, says", [
+    ({"WOO_BASE_URL": None}, "set WOO_BASE_URL"),
+    ({"WOO_BASE_URL": "http://shop.example.com"}, "must start with https://"),
+    ({"WOO_BASE_URL": "https://shop.example.com,EVIL=1"}, "WOO_BASE_URL"),
+    ({"ADMIN_EMAIL": None}, "set ADMIN_EMAIL"),
+    ({"ADMIN_EMAIL": "x'@example.com"}, "ADMIN_EMAIL"),
+    ({"LLM_MODEL": "a,b"}, "LLM_MODEL"),
+    ({"GCP_TAG": "-bad tag"}, "GCP_TAG"),
+    ({"STUB_BILLING_ACCOUNT": ""}, "no billing account"),
+])
+def test_gcp_deploy_stops_before_changing_anything_when_a_setting_is_wrong(env, change, says):
+    gcp_ready(env)
+    r = env.run("gcp-deploy.sh", **{**DEPLOY, **change})
+    assert r.returncode != 0 and says in r.stderr
+    assert not [c for c in env.calls("gcloud") if re.match(r"gcloud (services|builds|run|\S+ \S+ create)", c)]
+
+
+def test_gcp_deploy_stops_when_a_secret_is_missing_and_says_how_to_make_it(env):
+    r = env.run("gcp-deploy.sh", **DEPLOY)
+    assert r.returncode != 0 and "gcp-secrets.sh" in r.stderr
+    assert not gcloud_calls(env, "builds submit") and not gcloud_calls(env, "run deploy")
+
+
+@pytest.mark.parametrize("answer", ["", "yes", "y", "DELETE"])
+def test_gcp_teardown_deletes_nothing_unless_delete_is_typed(env, answer):
+    r = env.run("gcp-teardown.sh", stdin=answer + "\n")
+    assert r.returncode != 0 and "nothing was changed" in r.stderr and not gcloud_calls(env, "run services delete")
+
+
+def test_gcp_teardown_deletes_the_services_and_keeps_the_secrets(env):
+    gcp_ready(env)
+    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    r = env.run("gcp-teardown.sh", stdin="delete\n")
+    assert r.returncode == 0, r.stderr
+    assert [c.split()[4] for c in gcloud_calls(env, "run services delete")] == ["gateway", "woo-mcp", "gst"]
+    assert not [c for c in env.calls("gcloud") if "secrets delete" in c or "destroy" in c or "repositories delete" in c]
+    assert all((env.state / "gcloud" / "secrets" / n).is_dir() for n in SECRET_NAMES)
+    r = env.run("gcp-teardown.sh", "--yes")  # nothing left to delete: fine
+    assert r.returncode == 0 and r.stdout.count("not found (fine)") == 3
+    assert env.run("gcp-teardown.sh", "--force").returncode != 0

@@ -64,9 +64,40 @@ server credentials it has stored.
 The host names contain the IP. Run `scripts/deploy-local.sh` again (it detects the new address). Better: reserve
 the HP's address in the router (DHCP reservation) so it never changes.
 
+## Cloud Run (Google Cloud, free tier)
+A second way to run the gateway, woo-mcp and gst, with no cluster. Run from the Mac. It needs `gcloud`, logged in
+(`gcloud auth login`), and a project with a billing account linked, because the free tiers still need one. The store
+stays where it is and must be reachable at a public HTTPS address.
+```bash
+scripts/gcp-secrets.sh    # once: the secrets (asks for the Groq key and the store's WooCommerce key pair, hidden)
+WOO_BASE_URL=https://<store> ADMIN_EMAIL=<you> scripts/gcp-deploy.sh   # build + deploy; run again after every change
+scripts/gcp-teardown.sh   # deletes the three services; secrets and images are kept
+```
+
+| Script | Does | Safety |
+|---|---|---|
+| `gcp-secrets.sh` | 5 Secret Manager secrets. `gateway-env` holds the gateway's secret key, admin key and LLM key as one file (`GATEWAY_SECRETS_FILE`). The others are the two MCP tokens and the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value creates nothing |
+| `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys woo-mcp, gst, then the gateway (its seed needs their URLs) | Checks every setting, billing and the secrets before changing anything |
+| `gcp-teardown.sh [--yes]` | Deletes the three Cloud Run services | Asks for `delete` to be typed |
+
+**How it stays free:**
+- **Services:** no instance while idle, CPU only during requests, and a cap on instances.
+- **Secrets:** five secret values, inside Secret Manager's free six. Old versions are destroyed, because every version that isn't destroyed is billed.
+- **Images:** the 2 newest of each are kept, to stay under the free 0.5 GB.
+- **Builds:** run on Cloud Build's default machine. Uploads go to a regional bucket that deletes them after a day.
+- **Budget alert:** set to 1 unit of the billing account's currency. It only warns; it never stops spending.
+
+**The price of free (Kubernetes keeps all of these):**
+- After about 15 idle minutes the gateway stops and its in-memory database goes with it. The dashboard's audit view, sessions and members invited from the dashboard reset.
+- The admin key, the servers and seeded users come back by themselves, and every audit line stays in Cloud Logging.
+- After an idle spell, the first request takes a few seconds.
+
+Read the admin key when needed:
+`gcloud secrets versions access latest --secret=gateway-env | sed -n 's/^GATEWAY_ADMIN_KEY=//p'`
+
 ## Tests
 `scripts/tests/run.sh` (on the Mac; no cluster needed): the real scripts run against stand-ins for
-kubectl/docker/k3d/helm/rsync, checking calls, order, safety checks and that no secret leaks.
+kubectl/docker/k3d/helm/rsync/gcloud, checking calls, order, safety checks and that no secret leaks.
 
 ## Before every push
 ```bash

@@ -140,10 +140,10 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
         compensations = CompensationRegistry()
         register_woo_compensations(compensations, settings.woo_slug)
 
-    started = {"seed_file": settings.seed_file is not None}
-    if settings.seed_file is not None:  # raises SeedError on a bad file: the gateway then refuses to start
-        report = apply_seed(settings.seed_file, os.environ if env is None else env, registry, audit, incidents,
-                            auth=auth)
+    seed = settings.seed_file or settings.seed_json  # a file (Kubernetes) or the same JSON as text (Cloud Run)
+    started = {"seed_file": seed is not None}  # the key predates GATEWAY_SEED_JSON: true for either source
+    if seed is not None:  # raises SeedError on a bad seed: the gateway then refuses to start
+        report = apply_seed(seed, os.environ if env is None else env, registry, audit, incidents, auth=auth)
         started.update(created=[c.slug for c in report.changes if c.action == "created"],
                        updated=[c.slug for c in report.changes if c.action == "updated"],
                        unchanged=report.unchanged)

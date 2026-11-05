@@ -1,0 +1,26 @@
+# Builds the Cloud Run images in parallel and pushes them to Artifact Registry. Run by scripts/gcp-deploy.sh:
+#   gcloud builds submit --config=deploy/gcp/cloudbuild.yaml --substitutions=_REPO=<region>-docker.pkg.dev/<project>/<repo>,_TAG=<tag>
+# The images are the same ones Kubernetes runs (same Dockerfiles); Cloud Build machines are amd64, like Cloud Run.
+steps:
+  - id: gateway
+    name: gcr.io/cloud-builders/docker
+    args: [build, -t, "${_REPO}/gateway:${_TAG}", backend]
+    waitFor: ["-"]                  # "-" = start at once: the three builds run side by side
+  - id: woo-mcp
+    name: gcr.io/cloud-builders/docker
+    args: [build, -t, "${_REPO}/woo-mcp:${_TAG}", woo-mcp]
+    waitFor: ["-"]
+  - id: gst-mcp
+    name: gcr.io/cloud-builders/docker
+    args: [build, -t, "${_REPO}/gst-mcp:${_TAG}", upstreams/gst]
+    waitFor: ["-"]
+
+images:                             # pushed once every step has succeeded
+  - "${_REPO}/gateway:${_TAG}"
+  - "${_REPO}/woo-mcp:${_TAG}"
+  - "${_REPO}/gst-mcp:${_TAG}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY       # build logs in Cloud Logging only, not in an extra Cloud Storage bucket
+  # No machineType on purpose: the free build minutes apply to the default machine (e2-standard-2) only.
+timeout: 1200s
