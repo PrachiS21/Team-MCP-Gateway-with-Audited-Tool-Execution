@@ -8,9 +8,14 @@
 | Members' API keys and dashboard sessions | only SHA-256 hashes in the gateway's database |
 | The LLM API key (chat) | Kubernetes Secret, given only to the gateway |
 | Store data (products, orders) and the audit log | WooCommerce database; gateway database |
+| On Google Cloud: the same secrets, plus the ADK and CX agents' keys | Secret Manager (`gateway-env` and the tokens), read only by the service that needs each |
+| The CX agent's key | also in the Dialogflow CX agent's webhook settings, at Google |
+| The audit trail's copy | Cloud Logging (ids only; see section 5) |
 
 Who might act against them: a member misusing their own access, a member against another member, someone who obtains
-a member's key, an upstream MCP server that is malicious or compromised, someone on the same network.
+a member's key, an upstream MCP server that is malicious or compromised, someone on the same network. On Google Cloud
+also: anyone on the internet (the gateway, the dashboard and woo-mcp have public addresses there), and the anonymous
+customers who talk to a Dialogflow CX agent.
 
 ## 1. Shared upstream credentials: what can a member do with a credential they never see?
 The gateway holds one credential per server and uses it for every member. So a member **can do anything the tools of
@@ -82,6 +87,42 @@ it. External clients (Claude Code, Cursor) apply their own policies, such as ask
 - **Can** use shared rate limits and quotas (the LLM provider's, the store's); there is no per-user rate limit.
 - **An admin** can revoke anyone's keys, deactivate members and read every member's audit trail. That is the role.
 
+## 5. Google Cloud: what is on the internet, and what limits it
+See [google-cloud.md](google-cloud.md) for the deployment itself.
+
+**The gateway and the dashboard have public `run.app` addresses.** Anyone can reach them; the API key is the lock, as on
+`/mcp` everywhere. Cloud Run's own sign-in (IAM) is not used, because MCP clients and Dialogflow CX send an API key, not
+a Google identity. No rate limiting; a flood of requests is bounded by the instance caps and noticed by the budget alert.
+
+**woo-mcp is public through Tailscale Funnel**, behind its one bearer token: 192 random bits, compared in constant time.
+Whoever has the token can call woo-mcp directly and skip everything the gateway adds: per-user keys, the audit log and
+undo. It is kept in the HP's Kubernetes Secret, in Secret Manager and in the gateway's memory, and never logged.
+
+Containment:
+- Funnel reaches woo-mcp alone. Its proxy has only woo-mcp as a backend, so no `Host` header can lead elsewhere.
+- woo-mcp's NetworkPolicy lets it talk only to WordPress, so a compromised woo-mcp cannot reach the home network.
+
+**Dialogflow CX customers are anonymous and share one member key.** The webhook:
+- offers only read-only tools (and `GATEWAY_CX_TOOLS` can narrow them);
+- treats the conversation history CX sends back as untrusted input;
+- refuses an admin's key, because that key is stored in the CX agent's settings at Google;
+- never logs what customers write.
+
+Order results carry no customer names, emails, phones or addresses (woo-mcp's `shapes.py`), but they do show the shop's
+order data. Before putting a CX agent on a public website, narrow `GATEWAY_CX_TOOLS` to products and GST.
+
+**The ADK agent** uses a member key. Tools that may change something wait for the person's confirmation; tool results
+are data, never instructions. Its LiteLLM dependency is pinned to an exact version and locked by hash, because
+LiteLLM 1.82.7 and 1.82.8 on PyPI were a credential stealer (March 2026).
+
+**Logs are a data store.** Cloud Logging keeps a copy of every audit line for 30 days, readable by anyone with log access
+to the project. The lines hold ids, not secrets: no API key, no email, no tool arguments, no customer text. Tests check
+the formatted JSON, not only the message.
+
+**Secrets on Google Cloud** live in Secret Manager, each readable only by the service account that needs it. The
+scripts never put a value on a command line or in their output, and `.gcloudignore` keeps local secret files out of the
+uploads to Cloud Build.
+
 ## Other controls
 - API keys: 256-bit random, shown once, only a SHA-256 hash stored, constant-time comparison, revoked instantly.
 - Dashboard sessions: HttpOnly, SameSite=Strict cookie, 8 hours, re-checked on every request; revoking the key a
@@ -116,6 +157,12 @@ it. External clients (Claude Code, Cursor) apply their own policies, such as ask
   fails. If the whole server is gone, the job fails at once. Only `woo__delete_product` is used as an undo tool.
 - **Clients are not told when the tool list changes.** A disabled server's tools disappear when a client next lists
   tools (the chat does so on every question; Claude Code on reconnect). Calls to it are refused immediately either way.
+- **A member's key can call every tool on `/mcp`, including ones that change something.** This holds for the CX and
+  ADK agents' keys too: their read-only rule is in the webhook and in the agent, not in the gateway. A leaked CX key
+  can therefore call `delete_product` directly. Per-user tool permissions are the fix (not built).
+- **On Cloud Run, revoking a seeded key lasts until the next restart.** The database starts empty and the seed
+  registers the key again, so real revocation means a new value in `gateway-env` and a redeploy.
+- **The public `run.app` addresses have no rate limiting**, and Tailscale does not publish Funnel's bandwidth limits.
 - **Not yet covered by automated tests:** the gateway's `/readyz` answering 503 when its database fails; a browser's
   plain `GET /mcp`; malformed `Authorization` headers on the gateway's `/mcp` sent over a raw socket (the MCP servers
   have these tests; the gateway uses the same FastMCP authentication).

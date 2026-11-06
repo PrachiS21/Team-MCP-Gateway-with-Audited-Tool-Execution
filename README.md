@@ -1,4 +1,4 @@
-# WooCommerce MCP Gateway on Kubernetes
+# WooCommerce MCP Gateway on Kubernetes and Cloud Run
 
 **Author:** Prachi.
 
@@ -6,6 +6,9 @@ A WooCommerce store on Kubernetes, with a **team MCP gateway** in front of every
 registers each server once in a dashboard. Every team member then uses all of them through **one MCP endpoint and their
 own API key**, from Claude Code, Cursor or MCP Inspector, or through a **chat agent in the dashboard**. Members never see
 the servers' credentials, and every tool call is in an audit log.
+
+It also runs on **Google Cloud Run, inside the free tiers**, with a **Dialogflow CX webhook** that answers customers
+through the gateway and a **Google ADK agent** whose only tools are the gateway's ([Google Cloud](docs/google-cloud.md)).
 
 ```
  Browser: dashboard + chat ─┐                      ┌─► gateway ─┬─► woo-mcp ─► WordPress + WooCommerce ─► MariaDB
@@ -23,11 +26,14 @@ the servers' credentials, and every tool call is in an audit log.
 | Two more upstream servers: `gst` (mine), `everything` (official reference server) | `upstreams/` |
 | Dashboard (React) | `frontend/` |
 | Helm charts: `store` and `platform`, with `values-local.yaml` / `values-prod.yaml` | `deploy/helm/` |
-| Scripts: cluster, images, secrets, deploy, demo client | `scripts/` |
+| Scripts: cluster, images, secrets, deploy, demo client; Google Cloud (`gcp-*.sh`) | `scripts/` |
+| Google Cloud: Cloud Build config, monitoring as code | `deploy/gcp/` |
+| Google ADK agent that uses the gateway as its MCP toolset | `adk-agent/` |
 | Docker Compose store used for the early contract tests | `deploy/compose/` |
 
 Documents: [Architecture diagrams](docs/architecture.html) (download and open in a browser: high-level design, then
 five low-level designs) · [System design and trade-offs](docs/design.md) · [Threat model](docs/threat-model.md) ·
+[Google Cloud deployment](docs/google-cloud.md) ·
 [Status codes and error meanings](Status_Codes.md) · [Script reference](scripts/README.md)
 
 ---
@@ -113,6 +119,19 @@ provider has a better one, how Secrets are created. Details: [docs/design.md](do
 `--atomic`, Helm 3); `helm history <release> -n <ns>`; `helm rollback <release> <revision> -n <ns>`. Volumes keep their
 data through both.
 
+## Google Cloud (Cloud Run, free tier)
+The gateway, the dashboard and gst on Cloud Run; woo-mcp stays on the cluster machine next to the store and is
+published through Tailscale Funnel. Set up to cost nothing:
+- no instance runs while idle;
+- secrets fit Secret Manager's free six;
+- old images are cleaned up;
+- monitoring uses only free features, with a budget alert as the one notification.
+
+The price of free: the gateway's database lives in memory and resets after an idle spell (keys and servers come back
+from the seed; the audit trail is kept in Cloud Logging). The first real deployment is pending.
+[docs/google-cloud.md](docs/google-cloud.md) has the design, the costs and the limits; [scripts/README.md](scripts/README.md#cloud-run-google-cloud-free-tier)
+has the commands.
+
 ---
 
 ## How to use it
@@ -145,6 +164,13 @@ Dashboard → **Chat**. Ask *Create a product called "Lego Crown" priced at 1299
 Each answer lists the tool calls it made (expand to see arguments and results). The agent acts as the logged-in user: its calls
 are in the audit log under that user's name with source `chat`.
 
+### Dialogflow CX and the ADK agent
+- **Dialogflow CX** (with `GATEWAY_CX_ENABLED`): a CX agent sends customers' messages to `/api/cx/webhook`, which
+  answers with read-only tools only, as its own member user (source `cx`). Console steps:
+  [scripts/README.md](scripts/README.md#cloud-run-google-cloud-free-tier).
+- **ADK agent:** `cd adk-agent && uv run adk web --port 8090 .` with a member key; changes wait for your yes. See
+  [adk-agent/README.md](adk-agent/README.md).
+
 ### Admin controls
 - **Servers:** live status (Connected / Unreachable / Disabled) and tools of each; add a server by URL with an optional
   bearer token or custom header; edit, disable, enable, remove. The WooCommerce server is registered at startup.
@@ -160,7 +186,8 @@ cd backend && uv run pytest              # gateway: endpoint, auth, audit, routi
 cd woo-mcp && uv run pytest              # WooCommerce MCP server against a fake WooCommerce API
 cd upstreams/gst && uv run pytest        # GST server
 deploy/helm/tests/run.sh                 # charts: rendered for local and prod, checked without a cluster
-scripts/tests/run.sh                     # scripts, against stand-ins for kubectl/docker/k3d/helm; and a scan
+cd adk-agent && uv run pytest           # ADK agent, against a real gateway in-process and a scripted model
+scripts/tests/run.sh                     # scripts, against stand-ins for kubectl/docker/k3d/helm/gcloud; and a scan
                                          # that fails if any real-looking key is in a file git would publish
 ```
 Against real systems:
@@ -188,6 +215,6 @@ own namespace).
 | Item | What exists | Where |
 |---|---|---|
 | Security hardening | SSRF checks on server URLs (metadata and link-local blocked); NetworkPolicies deny by default in both namespaces; non-root containers, read-only root filesystems; upstream credentials encrypted at rest (Fernet). No component uses the Kubernetes API, so no RBAC is needed. | `backend/src/gateway/registry/`, `deploy/helm/*/templates/networkpolicy.yaml` |
-| Observability (partial) | Clear reasons for unreachable servers and failed calls, in the dashboard and the audit log; no metrics. | `Status_Codes.md`, Servers and Audit log pages |
+| Observability | Clear reasons for unreachable servers and failed calls, in the dashboard and the audit log. On Google Cloud: JSON logs linked to request traces, logs-based metrics, a dashboard and an uptime check (no alerts: they are billed). | `Status_Codes.md`, `backend/src/gateway/logs.py`, `deploy/gcp/observability/` |
 | Upgrades and rollback | `helm upgrade`, automatic rollback of failed upgrades, `helm rollback`; setup Job re-run per revision. | `scripts/deploy-local.sh`, [design](docs/design.md#upgrade-and-rollback) |
 | Undo layer | Automatic undo of a successful action whose audit record failed (durable job queue with retries). | `backend/src/gateway/compensation.py`, `undo_worker.py` |
