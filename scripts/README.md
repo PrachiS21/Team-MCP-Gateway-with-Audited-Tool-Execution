@@ -65,8 +65,10 @@ The host names contain the IP. Run `scripts/deploy-local.sh` again (it detects t
 the HP's address in the router (DHCP reservation) so it never changes.
 
 ## Cloud Run (Google Cloud, free tier)
-A second way to run the platform. The gateway and gst run on Cloud Run. woo-mcp stays on the HP next to the store, and
-only woo-mcp is published, through Tailscale Funnel; the store and its WooCommerce keys never leave the HP.
+A second way to run the platform. The gateway, gst and the dashboard run on Cloud Run. The dashboard forwards `/api` to
+the gateway (`frontend/nginx.cloudrun.conf.template`), so the login cookie works as in Kubernetes. woo-mcp stays on the
+HP next to the store, and only woo-mcp is published, through Tailscale Funnel; the store and its WooCommerce keys
+never leave the HP.
 (`gcp-deploy.sh` can also run woo-mcp on Cloud Run, for a store with its own public HTTPS address: see its header.)
 
 **1. On the HP: publish woo-mcp (once).**
@@ -97,7 +99,7 @@ scripts/gcp-teardown.sh   # deletes the Cloud Run services and the uptime check;
 |---|---|---|
 | `tailscale-operator.sh` (HP) | Stores the Tailscale OAuth client as the Secret `tailscale/operator-oauth`, then installs Tailscale's operator | The secret never goes on a command line (Helm gets no credentials); an existing Secret is kept; local cluster only |
 | `gcp-secrets.sh` | 3 Secret Manager secrets: `gateway-env` (the gateway's secret key, admin key, LLM key and the ADK agent's key as one file, `GATEWAY_SECRETS_FILE`) and the two MCP tokens. With woo-mcp on Cloud Run: 5, adding the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value, such as a token still in base64, creates nothing |
-| `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys gst, then the gateway (its seed needs the URLs) | Checks every setting, billing and the secrets before changing anything |
+| `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys gst, the gateway (its seed needs gst's URL), then the dashboard (it needs the gateway's); prints the dashboard's address | Checks every setting, billing and the secrets before changing anything |
 | `gcp-observability.sh` | Creates four logs-based metrics (`deploy/gcp/observability/metrics/`), the "MCP gateway" dashboard and an uptime check on `/health` | Needs the gateway deployed; makes nothing twice; creates no alert policies (they are billed) |
 | `gcp-teardown.sh [--yes]` | Deletes the Cloud Run services and the uptime check | Asks for `delete` to be typed |
 

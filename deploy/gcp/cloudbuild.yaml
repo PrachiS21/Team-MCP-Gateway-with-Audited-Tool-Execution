@@ -11,10 +11,15 @@ steps:
     name: gcr.io/cloud-builders/docker
     args: [build, -t, "${_REPO}/gst-mcp:${_TAG}", upstreams/gst]
     waitFor: ["-"]
+  - id: dashboard
+    name: gcr.io/cloud-builders/docker
+    args: [build, --target, cloudrun, -t, "${_REPO}/dashboard:${_TAG}", frontend]  # /api forwarded to the gateway
+    waitFor: ["-"]
 
 images:                             # pushed once every step has succeeded
   - "${_REPO}/gateway:${_TAG}"
   - "${_REPO}/gst-mcp:${_TAG}"
+  - "${_REPO}/dashboard:${_TAG}"
 
 options:
   logging: CLOUD_LOGGING_ONLY       # build logs in Cloud Logging only, not in an extra Cloud Storage bucket

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds the images with Cloud Build and deploys gst, the gateway and (when asked) woo-mcp to Cloud Run, set up to stay
-# inside the free tiers (each step says how). The dashboard joins once it has a Cloud Run proxy config.
+# Builds the images with Cloud Build and deploys gst, the gateway, the dashboard and (when asked) woo-mcp to Cloud Run,
+# set up to stay inside the free tiers (each step says how).
 # Needs: gcloud, logged in (gcloud auth login); a project with a billing account linked (the free tiers still need
 # one); the secrets from scripts/gcp-secrets.sh, made with the same WOO_MCP_URL.
 # Safe to run again: each step creates only what is missing, then every service gets a new revision.
@@ -161,6 +161,7 @@ service_account() {
 }
 service_account gateway gateway-env woo-mcp-token gst-mcp-token
 service_account gst gst-mcp-token
+service_account dashboard  # no secrets: an account with no permissions at all, instead of the Editor default
 if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then service_account woo-mcp woo-mcp-token $GCP_STORE_SECRETS; fi
 
 # -- 5. Build the images (deploy/gcp/cloudbuild.yaml; woo-mcp's own file only when it runs on Cloud Run).
@@ -171,7 +172,7 @@ build() {
   gcloud builds submit "$ROOT" --project="$PROJECT" --config="$ROOT/deploy/gcp/$1" \
     --substitutions="_REPO=$REPO_URL,_TAG=$TAG" --gcs-source-staging-dir="$BUCKET/source"
 }
-log "building gateway and gst-mcp as :$TAG with Cloud Build (a few minutes)"
+log "building gateway, gst-mcp and the dashboard as :$TAG with Cloud Build (a few minutes)"
 build cloudbuild.yaml
 if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then
   log "building woo-mcp as :$TAG"
@@ -238,7 +239,14 @@ deploy gateway gateway --max-instances=1 --timeout=300 \
   --set-secrets="/secrets/gateway/env=gateway-env:latest,WOO_MCP_TOKEN=woo-mcp-token:latest,GST_MCP_TOKEN=gst-mcp-token:latest"
 GW_URL="$(url_of gateway)"
 
-log "done. Gateway: $GW_URL   (MCP endpoint $GW_URL/mcp, health $GW_URL/health); woo-mcp: $WOO_MCP_URL"
+# The dashboard: static files, with /api/ forwarded to the gateway (frontend/nginx.cloudrun.conf.template). The
+# browser stays on one address, so the login cookie (SameSite=Strict, path /api) works as in Kubernetes.
+deploy dashboard dashboard --max-instances=2 --timeout=300 \
+  --set-env-vars="GATEWAY_URL=$GW_URL,GATEWAY_HOST=${GW_URL#https://}"
+DASHBOARD_URL="$(url_of dashboard)"
+
+log "done. Dashboard: $DASHBOARD_URL (log in with an API key)"
+log "Gateway: $GW_URL   (MCP endpoint $GW_URL/mcp, health $GW_URL/health); woo-mcp: $WOO_MCP_URL"
 log "the admin key, when you need it: gcloud secrets versions access latest --secret=gateway-env --project=$PROJECT | sed -n 's/^GATEWAY_ADMIN_KEY=//p'"
 log "Dialogflow CX webhook: $GW_URL/api/cx/webhook with the header Authorization: Bearer <CX_AGENT_KEY> (read it the same way)"
 log "Claude Code: claude mcp add --transport http gateway $GW_URL/mcp --header \"Authorization: Bearer <the admin key>\""

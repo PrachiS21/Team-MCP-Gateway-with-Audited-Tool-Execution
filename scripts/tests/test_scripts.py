@@ -508,7 +508,7 @@ def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_
     assert [re.search(r"--config=(\S+)", b).group(1) for b in builds] == [
         f"{root}/deploy/gcp/cloudbuild.yaml", f"{root}/deploy/gcp/cloudbuild-woo-mcp.yaml"]
     deploys = gcloud_calls(env, "run deploy")
-    assert [d.split()[3] for d in deploys] == ["woo-mcp", "gst", "gateway"]  # the gateway's seed needs their URLs
+    assert [d.split()[3] for d in deploys] == ["woo-mcp", "gst", "gateway", "dashboard"]  # each needs the URLs before it
     assert calls.index(builds[-1]) < calls.index(deploys[0])
     for d in deploys:
         name = d.split()[3]
@@ -518,7 +518,7 @@ def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_
         assert "--no-cpu-throttling" not in d  # that is instance billing: about $40 a month for an always-on gateway
         image = "gst-mcp" if name == "gst" else name
         assert re.search(rf"--image=us-central1-docker\.pkg\.dev/demo-proj/mcp/{image}:\d{{8}}-\d{{6}}-abc1234 ", d)
-    woo, gst, gw = deploys
+    woo, gst, gw, dash = deploys
     assert "--max-instances=2" in woo and "--max-instances=2" in gst
     assert "--max-instances=1" in gw  # one instance = one database
     assert "WOO_BASE_URL=https://shop.example.com" in woo and "WOO_CONSUMER_SECRET=woo-consumer-secret:latest" in woo
@@ -611,7 +611,7 @@ def test_with_woo_mcp_on_the_hp_nothing_of_it_is_built_or_deployed_and_the_seed_
     assert r.returncode == 0, r.stderr
     [build] = gcloud_calls(env, "builds submit")
     assert f"--config={SCRIPTS.parent}/deploy/gcp/cloudbuild.yaml " in build + " "
-    assert [d.split()[3] for d in gcloud_calls(env, "run deploy")] == ["gst", "gateway"]
+    assert [d.split()[3] for d in gcloud_calls(env, "run deploy")] == ["gst", "gateway", "dashboard"]
     assert not [c for c in env.calls("gcloud") if "woo-mcp-run" in c or "woo-consumer" in c]
     gw = yaml.safe_load((env.state / "gcloud" / "vars" / "gateway.yaml").read_text())
     entries = load_seed(gw["GATEWAY_SEED_JSON"], {"WOO_MCP_TOKEN": HP_TOKEN, "GST_MCP_TOKEN": "t2"})
@@ -640,7 +640,8 @@ def test_the_files_in_deploy_gcp_hold_what_the_scripts_promise():
     woo = yaml.safe_load((GCP / "cloudbuild-woo-mcp.yaml").read_text())
     # the same folders build-images.sh builds for Kubernetes; woo-mcp on its own, built only for Cloud Run
     assert [(s["id"], s["args"][-1], s["waitFor"]) for s in build["steps"]] == [
-        ("gateway", "backend", ["-"]), ("gst-mcp", "upstreams/gst", ["-"])]
+        ("gateway", "backend", ["-"]), ("gst-mcp", "upstreams/gst", ["-"]), ("dashboard", "frontend", ["-"])]
+    assert build["steps"][2]["args"][:3] == ["build", "--target", "cloudrun"]  # the dashboard's Cloud Run stage
     assert [(s["id"], s["args"][-1]) for s in woo["steps"]] == [("woo-mcp", "woo-mcp")]
     for config in (build, woo):
         assert config["images"] == [f"${{_REPO}}/{s['id']}:${{_TAG}}" for s in config["steps"]]
@@ -656,14 +657,14 @@ def test_gcp_deploy_run_again_creates_nothing_new_and_deploys_new_revisions(env)
     r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     assert not [c for c in env.calls("gcloud") if re.match(r"gcloud \S+ \S+ create", c)]
-    assert len(gcloud_calls(env, "run deploy")) == 3 and "already exists" in r.stdout  # the budget
+    assert len(gcloud_calls(env, "run deploy")) == 4 and "already exists" in r.stdout  # the budget
 
 
 def test_gcp_deploy_only_warns_when_the_budget_alert_cannot_be_made(env):
     gcp_ready(env)
     r = env.run("gcp-deploy.sh", STUB_BUDGETS_FAIL="1", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0 and "could not set up the budget alert" in r.stderr
-    assert len(gcloud_calls(env, "run deploy")) == 3
+    assert len(gcloud_calls(env, "run deploy")) == 4
 
 
 def test_gcp_deploy_marks_images_built_from_uncommitted_changes(env):
@@ -709,11 +710,11 @@ def test_gcp_teardown_deletes_the_services_and_keeps_the_secrets(env):
     assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     r = env.run("gcp-teardown.sh", stdin="delete\n")
     assert r.returncode == 0, r.stderr
-    assert [c.split()[4] for c in gcloud_calls(env, "run services delete")] == ["gateway", "woo-mcp", "gst"]
+    assert [c.split()[4] for c in gcloud_calls(env, "run services delete")] == ["gateway", "woo-mcp", "gst", "dashboard"]
     assert not [c for c in env.calls("gcloud") if "secrets delete" in c or "destroy" in c or "repositories delete" in c]
     assert all((env.state / "gcloud" / "secrets" / n).is_dir() for n in SECRET_NAMES)
     r = env.run("gcp-teardown.sh", "--yes")  # nothing left to delete: fine
-    assert r.returncode == 0 and r.stdout.count("not found (fine)") == 3
+    assert r.returncode == 0 and r.stdout.count("not found (fine)") == 4
     assert env.run("gcp-teardown.sh", "--force").returncode != 0
 
 
@@ -932,3 +933,62 @@ def test_the_dashboard_charts_our_metrics_and_fits_its_grid():
         area = {(x, y) for x in range(t["xPos"], t["xPos"] + t["width"]) for y in range(t["yPos"], t["yPos"] + t["height"])}
         assert not cells & area  # no two charts on top of each other
         cells |= area
+
+
+
+# -- the dashboard on Cloud Run: nginx forwards /api to the gateway ----------------------------------------------
+
+FRONTEND = SCRIPTS.parent / "frontend"
+TEMPLATE = (FRONTEND / "nginx.cloudrun.conf.template").read_text()
+NGINX_VARS = ("$uri", "$gateway", "$proxy_add_x_forwarded_for")  # nginx's own: envsubst must never touch them
+
+
+def dockerfile_stages() -> list[str]:
+    return re.split(r"(?m)^FROM ", (FRONTEND / "Dockerfile").read_text())[1:]
+
+
+def test_the_dashboard_is_deployed_after_the_gateway_pointing_at_it_with_no_permissions(env):
+    hp_ready(env)
+    assert env.run("gcp-deploy.sh", **WOO_ON_HP).returncode == 0
+    gateway, dashboard = gcloud_calls(env, "run deploy")[-2:]
+    assert gateway.split()[3] == "gateway" and dashboard.split()[3] == "dashboard"
+    assert "--set-env-vars=GATEWAY_URL=https://gateway-abc123-uc.a.run.app,GATEWAY_HOST=gateway-abc123-uc.a.run.app" in dashboard
+    assert "--service-account=dashboard-run@demo-proj.iam.gserviceaccount.com" in dashboard and "--set-secrets" not in dashboard
+    assert "--max-instances=2" in dashboard and "--min-instances=0" in dashboard
+    assert "dashboard-run" not in (env.state / "gcloud" / "iam.txt").read_text()  # it may read no secret at all
+
+
+def test_kubernetes_still_builds_the_plain_dashboard_and_cloud_run_its_own_stage():
+    *_, cloudrun, kubernetes = dockerfile_stages()
+    assert cloudrun.startswith("nginxinc/nginx-unprivileged:1.28-alpine AS cloudrun")
+    assert "COPY nginx.cloudrun.conf.template /etc/nginx/templates/default.conf.template" in cloudrun
+    assert kubernetes.startswith("nginxinc/nginx-unprivileged:1.28-alpine\n")  # the last stage: what build-images.sh gets
+    assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in kubernetes and "template" not in kubernetes
+
+
+def test_only_the_three_settings_are_filled_in_and_nginx_variables_are_left_alone():
+    *_, cloudrun, _ = dockerfile_stages()
+    pattern = re.search(r'NGINX_ENVSUBST_FILTER="([^"]+)"', cloudrun).group(1)  # the image's envsubst filter (awk ERE)
+    placeholders = set(re.findall(r"\$\{([A-Z_]+)\}", TEMPLATE))
+    assert placeholders == {"GATEWAY_URL", "GATEWAY_HOST", "NGINX_LOCAL_RESOLVERS"}
+    assert all(re.search(pattern, name) for name in placeholders)
+    assert not any(re.search(pattern, v.lstrip("$")) for v in NGINX_VARS)
+    filled = TEMPLATE
+    for name, value in {"GATEWAY_URL": "https://gw.a.run.app", "GATEWAY_HOST": "gw.a.run.app",
+                        "NGINX_LOCAL_RESOLVERS": "169.254.169.254"}.items():
+        filled = filled.replace("${%s}" % name, value)
+    assert "${" not in filled and all(v in filled for v in NGINX_VARS)
+    assert "set $gateway https://gw.a.run.app;" in filled and "proxy_set_header Host gw.a.run.app;" in filled
+
+
+def test_the_cloud_run_dashboard_serves_what_kubernetes_serves_and_forwards_only_api_securely():
+    kubernetes = (FRONTEND / "nginx.conf").read_text()
+    lines = lambda text, start: [l.strip() for l in text.splitlines() if l.strip().startswith(start)]
+    assert lines(TEMPLATE, "add_header") == lines(kubernetes, "add_header")  # the same security headers
+    static = lambda text: re.findall(r"location (= /|/assets/|/) \{([^}]*)\}", text)
+    assert static(TEMPLATE) == static(kubernetes)  # the same files, cached the same way
+    api = re.search(r"location /api/ \{(.*?)\n    \}", TEMPLATE, re.S).group(1)  # ${...} has braces of its own
+    for setting in ("proxy_pass $gateway;", "proxy_ssl_verify on;", "proxy_ssl_server_name on;",
+                    "proxy_set_header Host ${GATEWAY_HOST};", "proxy_read_timeout 300s;"):
+        assert setting in api, setting
+    assert "/mcp" not in TEMPLATE.split("server {", 1)[1]  # MCP clients use the gateway's own address
