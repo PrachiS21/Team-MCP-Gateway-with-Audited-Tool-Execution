@@ -1,0 +1,28 @@
+[project]
+name = "gateway-agent"
+version = "0.1.0"
+description = "A Google ADK agent whose only tools come from the MCP gateway"
+authors = [{ name = "Prachi" }]
+requires-python = ">=3.11"
+dependencies = [
+    "google-adk[mcp]==2.13.0",
+    # Exact pin on purpose. litellm 1.82.7 and 1.82.8 were a credential stealer published to PyPI (March 2026,
+    # GHSA-5mg7-485q-xm76). uv.lock also records every file's hash, so nothing changes unless we upgrade on purpose;
+    # check the advisories first, and stay inside google-adk's own range (>=1.84,<1.106.3 for 2.13.0).
+    "litellm==1.106.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "mcp-gateway-backend",  # the gateway, for the tests only: they run a real gateway in front of the agent
+]
+
+[tool.uv.sources]
+mcp-gateway-backend = { path = "../backend", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,50 @@
+# Cloud Run only (`docker build --target cloudrun`; Kubernetes uses nginx.conf, where the Ingress routes /api).
+# The image's entrypoint fills this in at start with envsubst. Only GATEWAY_URL, GATEWAY_HOST and
+# NGINX_LOCAL_RESOLVERS are replaced (NGINX_ENVSUBST_FILTER in the Dockerfile); nginx's own $variables are left alone.
+#
+# The same static files and security headers as nginx.conf, plus /api/, forwarded to the gateway's own Cloud Run
+# address. Why forward instead of letting the browser call the gateway: the login cookie is SameSite=Strict and set
+# for path /api of the site that set it. Served through here, /api is on the dashboard's own address, so the cookie
+# works exactly as in Kubernetes and no cross-site requests (CORS) are needed. (Rejected: Google's HTTPS load
+# balancer, which could put both behind one address, costs about $18 a month.)
+server {
+    listen 8080;
+    root /usr/share/nginx/html;
+    server_tokens off;
+
+    # The container's own DNS server (read from /etc/resolv.conf at start): the gateway's address is looked up when
+    # needed, since it can change, not once at start. Putting the URL in a variable is what makes proxy_pass use it.
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=60s ipv6=off;
+    set $gateway ${GATEWAY_URL};
+
+    add_header Content-Security-Policy "default-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location = / {
+        expires -1;                 # Cache-Control: no-cache, so a new deploy's index.html is picked up at once
+        try_files /index.html =404;
+    }
+    location /assets/ {
+        expires 1y;                 # file names contain a content hash, so they never change
+        try_files $uri =404;
+    }
+    location / {
+        try_files $uri =404;
+    }
+
+    location /api/ {
+        proxy_pass $gateway;                        # the request's own path and query go on unchanged
+        proxy_set_header Host ${GATEWAY_HOST};      # Cloud Run picks the service by Host...
+        proxy_ssl_server_name on;                   # ...and by the TLS server name
+        proxy_ssl_name ${GATEWAY_HOST};
+        proxy_ssl_verify on;                        # it really is the gateway, not someone in between
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify_depth 3;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;                    # one chat question may take up to 180 s
+        client_max_body_size 1m;
+    }
+}

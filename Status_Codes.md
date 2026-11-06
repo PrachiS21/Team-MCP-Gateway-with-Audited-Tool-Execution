@@ -24,6 +24,7 @@ The same failure shows up differently at each layer. Section 11 traces common sc
 | **404** | any other path, e.g. `/` | There is nothing at that path. "Not found" at `http://localhost:8000/` is normal: the gateway has no web page. | Use `/mcp`, `/healthz` or `/readyz`. |
 | **200** | `/healthz` | The process is up (Kubernetes liveness). Needs no key. | Nothing. |
 | **200 / 503** | `/readyz` | 200 `ready`: the database answers. 503 `database unavailable`: it does not (Kubernetes readiness). Coded, not covered by a test. | Check the database file or connection. |
+| | `/health`, `/ready` | The same as `/healthz` and `/readyz`. Cloud Run reserves URL paths ending in "z" (they answer Google's own 404 from outside), so Cloud Run and its uptime check use these. | |
 
 Some MCP clients show every rejection, including 401, as a generic "Server returned an error response". The real code is in the gateway's log.
 
@@ -40,6 +41,20 @@ Some MCP clients show every rejection, including 401, as a generic "Server retur
 | **409** | `conflict` | The slug or email is already used. |
 | **400** | `invalid` | Bad input, with the reason: bad slug, URL refused by the SSRF guard, missing credential, unknown field, an admin deactivating their own account, bad paging number. |
 | **415** | `json_required` | A POST or PATCH without a JSON body. This is the cross-site request forgery guard: an HTML form on another site cannot send JSON. |
+
+### 1a-3. Dialogflow CX webhook (`/api/cx/webhook`, only with `GATEWAY_CX_ENABLED`)
+
+| Code | `error` / `gw_status` | Meaning |
+|---|---|---|
+| **200** | `gw_status` `ok` | Answered. The reply is in `fulfillmentResponse`, the conversation in the session parameter `gw_history`. |
+| **200** | `gw_status` `error` | The language model failed or took too long (`GATEWAY_CX_TIMEOUT`). The customer gets a polite "try again" and the conversation goes on; the reason is in the gateway's log. |
+| **200** | `gw_status` `invalid` | The customer's message was too long; they are asked to say it in fewer words. |
+| **200** | `gw_status` `no_input` | CX called the webhook without customer text (on an event, say). No answer, no model call. |
+| **200** | `gw_status` `unavailable` | No language model is configured on this gateway. |
+| **401** | `unauthenticated` | No key, or a key that is wrong, revoked, or whose user is deactivated. Checked before the body is read; recorded as `auth_failed` with source `cx`. CX turns it into its `webhook.error` event. |
+| **403** | `forbidden` | An admin's key. The webhook takes a member's key only, because the key is stored in the CX agent's settings. |
+| **404** | | The webhook is off on this gateway (`GATEWAY_CX_ENABLED` not set). |
+| **415** | `json_required` | Not a JSON body. |
 
 ### 1b. WooCommerce MCP server
 
@@ -138,7 +153,7 @@ Every kind from sections 3 and 4 that applies, plus:
 | `reversal_failed` | closed undo row | The undo kept failing and was abandoned. Needs a human. |
 
 ### Sources
-`mcp` = an external client such as Claude Code or Cursor. `chat` = the dashboard chat agent. `api` = a dashboard login attempt (only `auth_failed` rows).
+`mcp` = an external client such as Claude Code, Cursor or the ADK agent. `chat` = the dashboard chat agent. `api` = a dashboard login attempt (only `auth_failed` rows). `cx` = the Dialogflow CX webhook (its tool calls, and refused keys).
 
 ---
 
@@ -154,6 +169,7 @@ Every gateway **start and restart** is recorded, whether or not anything changed
 | `server_created` | `system:seed` | A server from the seed file did not exist yet (matched by **slug**) and was created. |
 | `server_updated` | `system:seed` | A server with that slug existed but differed from the file. `changed` lists the field names (`name`, `url`, `credential_type`, `credential_header`, `timeout`, `credential`). `credential` means the secret changed; its value is never recorded. |
 | `server_unchanged` | `system:seed` | The server was checked and already matched the file. |
+| `user_created`, `user_updated`, `user_unchanged` | `system:seed` | A user from the seed's `users` section (a service account such as the CX or ADK agent's) was created, had its role or key brought in line (`changed` lists `role`, `key`), or already matched. Details hold the key's public id, never the key; `key_revoked: true` means the key was revoked and stays revoked. |
 
 **Actions from the CLI** are recorded too, with actor `cli:<operating-system user>` (the CLI has no login, so this is the best identity available). Only successful actions leave an event; a failed command leaves none. Secrets are never stored: keys appear only by their public id, and a credential change is recorded as `changed: ["credential"]`.
 

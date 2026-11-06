@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -22,7 +23,6 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
 from fastmcp.tools import Tool, ToolResult
 from mcp.types import TextContent
-from starlette.middleware import Middleware as ASGIMiddleware  # not fastmcp's Middleware (imported above)
 from starlette.responses import JSONResponse
 
 from gateway.api import register_api
@@ -32,6 +32,7 @@ from gateway.auth.keys import parse_key
 from gateway.auth.service import AuthService
 from gateway.compensation import CompensationRegistry
 from gateway.config import Settings
+from gateway.cx import CX_SYSTEM_PROMPT, MAX_STEPS as CX_MAX_STEPS, CxWebhook, cx_tool_filter
 from gateway.incidents import IncidentLog
 from gateway.jobs import UndoJobStore
 from gateway.locks import KeyedLocks
@@ -45,6 +46,25 @@ from gateway.woo_compensation import register_woo_compensations
 from gateway.undo_worker import UndoWorker
 
 log = logging.getLogger("gateway")
+
+_request_path: ContextVar[str | None] = ContextVar("request_path", default=None)  # of the request being handled
+
+
+class RequestPathMiddleware:
+    """Remembers the request's path while it is handled, for GatewayKeyVerifier. Plain ASGI, like TraceMiddleware."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        token = _request_path.set(scope.get("path"))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _request_path.reset(token)
 
 
 class GatewayKeyVerifier(TokenVerifier):
@@ -64,6 +84,12 @@ class GatewayKeyVerifier(TokenVerifier):
                            claims={"user_id": user.id, "email": user.email, "role": user.role, "key_id": key_id})
 
     def _record_failure(self, key_id: str | None) -> None:
+        path = _request_path.get()
+        if path is not None and not path.startswith("/mcp"):
+            # FastMCP checks a Bearer header on EVERY route, not only /mcp. A route that takes keys itself (the CX
+            # webhook) records its own refusal with its own source; recording here too would log an MCP call that
+            # never happened.
+            return
         try:  # never store the token itself, only its public id
             self._audit.record(outcome="auth_failed", key_id=key_id, error_kind="invalid_key")
         except Exception:  # noqa: BLE001 - a broken audit DB must not turn a 401 into a 500
@@ -122,8 +148,10 @@ class Gateway:
     api_routes: list  # (method, path, access) of every /api route
 
     def http_app(self):
-        # TraceMiddleware: lines logged while a request is handled carry its trace id (see logs.py)
-        return self.mcp.http_app(path="/mcp", stateless_http=True, middleware=[ASGIMiddleware(TraceMiddleware)])
+        # Both wrap the WHOLE app: middleware given to FastMCP runs inside its auth middleware, where the API key is
+        # checked (GatewayKeyVerifier), and that check needs both. TraceMiddleware: lines logged while a request is
+        # handled carry its trace id (logs.py). RequestPathMiddleware: the key check knows which route it serves.
+        return TraceMiddleware(RequestPathMiddleware(self.mcp.http_app(path="/mcp", stateless_http=True)))
 
 
 def create_gateway(settings: Settings, compensations: CompensationRegistry | None = None,
@@ -205,7 +233,16 @@ def create_gateway(settings: Settings, compensations: CompensationRegistry | Non
     if chat is None:
         log.info("chat agent off: set GATEWAY_LLM_MODEL and GATEWAY_LLM_API_KEY to turn it on")
 
+    cx = None
+    if settings.cx_enabled:  # a second agent on the same LLM, set up for customers (see cx.py)
+        cx_agent = None if llm is None else ChatAgent(
+            service, llm, max_steps=CX_MAX_STEPS, total_timeout=settings.cx_timeout,
+            tool_filter=cx_tool_filter(settings.cx_tools), system_prompt=CX_SYSTEM_PROMPT)
+        cx = CxWebhook(cx_agent, settings.cx_history_turns)
+        if cx_agent is None:
+            log.warning("CX webhook on without an LLM: it will answer that the assistant is not available")
+
     api_routes = register_api(mcp, auth=auth, registry=registry, audit=audit, manager=manager, service=service,
-                              cookie_secure=settings.cookie_secure, chat=chat)
+                              cookie_secure=settings.cookie_secure, chat=chat, cx=cx)
 
     return Gateway(settings, manager, registry, auth, audit, service, worker, mcp, api_routes)

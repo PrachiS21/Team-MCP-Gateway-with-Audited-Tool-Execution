@@ -3,6 +3,7 @@
 #   Traefik -> WordPress:80            (visitors)
 #   woo-mcp -> WordPress:80            (the MCP server calls the REST API)
 #   gateway (namespace platform) -> woo-mcp:8000
+#   with publicMcp on: Tailscale's proxy for woo-mcp-public -> woo-mcp:8000 (a gateway on the internet)
 #   WordPress and the setup Job -> MariaDB:3306
 #   the setup Job -> the internet on 80/443 (it downloads WordPress plugins)
 #   every pod -> cluster DNS
@@ -103,6 +104,17 @@ spec:
           podSelector:
             matchLabels:
               {{- toYaml $np.gateway.podLabels | nindent 14 }}
+        {{- if .Values.publicMcp.enabled }}
+        # The proxy Tailscale's operator runs for woo-mcp-public (templates/public-mcp.yaml), and no other pod of it:
+        # the operator labels each proxy with the Ingress it serves.
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ .Values.publicMcp.operatorNamespace }} }
+          podSelector:
+            matchLabels:
+              tailscale.com/managed: "true"
+              tailscale.com/parent-resource: woo-mcp-public
+              tailscale.com/parent-resource-ns: {{ .Release.Namespace }}
+        {{- end }}
       ports:
         - { protocol: TCP, port: 8000 }
   egress:

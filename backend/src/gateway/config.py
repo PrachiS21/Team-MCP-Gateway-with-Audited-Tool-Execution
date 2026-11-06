@@ -5,11 +5,12 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import MutableMapping
+from typing import Mapping, MutableMapping
 
 from gateway.logs import LOG_FORMATS
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")  # as the chat agent requires (chat.py)
 
 
 def load_secrets_file(environ: MutableMapping[str, str] = os.environ) -> list[str]:
@@ -64,6 +65,11 @@ class Settings:
     llm_timeout: float = 60.0  # GATEWAY_LLM_TIMEOUT: seconds per LLM request
     log_format: str = "text"  # GATEWAY_LOG_FORMAT: "text" (readable) or "json" (one object per line, for Cloud Logging)
     gcp_project: str | None = None  # GATEWAY_GCP_PROJECT: with json logs, links each line to its request's trace
+    # The Dialogflow CX webhook (cx.py): POST /api/cx/webhook exists only when enabled. It uses the chat agent's LLM.
+    cx_enabled: bool = False  # GATEWAY_CX_ENABLED=1
+    cx_timeout: float = 25.0  # GATEWAY_CX_TIMEOUT: seconds per customer message (CX waits at most 30)
+    cx_history_turns: int = 6  # GATEWAY_CX_HISTORY_TURNS: earlier exchanges sent back to the model (0-10)
+    cx_tools: tuple[str, ...] = ()  # GATEWAY_CX_TOOLS: comma-separated <server>__<tool>; empty = every read-only tool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -79,6 +85,7 @@ class Settings:
             raise SystemExit(f"GATEWAY_LOG_FORMAT must be one of {', '.join(LOG_FORMATS)}")
         if env.get("GATEWAY_SEED_FILE") and env.get("GATEWAY_SEED_JSON"):
             raise SystemExit("set GATEWAY_SEED_FILE or GATEWAY_SEED_JSON, not both")
+        cx_timeout, cx_history_turns, cx_tools = _cx_settings(env)
         return cls(
             secret_key=key,
             db_url=env.get("GATEWAY_DB_URL", cls.db_url),
@@ -101,4 +108,25 @@ class Settings:
             llm_timeout=float(env.get("GATEWAY_LLM_TIMEOUT", cls.llm_timeout)),
             log_format=log_format,
             gcp_project=env.get("GATEWAY_GCP_PROJECT") or None,
+            cx_enabled=env.get("GATEWAY_CX_ENABLED", "") in ("1", "true", "yes"),
+            cx_timeout=cx_timeout,
+            cx_history_turns=cx_history_turns,
+            cx_tools=cx_tools,
         )
+
+
+def _cx_settings(env: Mapping[str, str]) -> tuple[float, int, tuple[str, ...]]:
+    try:
+        timeout = float(env.get("GATEWAY_CX_TIMEOUT") or Settings.cx_timeout)
+        turns = int(env.get("GATEWAY_CX_HISTORY_TURNS") or Settings.cx_history_turns)
+    except ValueError:
+        raise SystemExit("GATEWAY_CX_TIMEOUT must be a number and GATEWAY_CX_HISTORY_TURNS a whole number") from None
+    if not 1 <= timeout < 30:
+        raise SystemExit("GATEWAY_CX_TIMEOUT must be at least 1 and under 30 seconds: Dialogflow CX waits at most 30")
+    if not 0 <= turns <= 10:
+        raise SystemExit("GATEWAY_CX_HISTORY_TURNS must be between 0 and 10")
+    tools = tuple(t.strip() for t in (env.get("GATEWAY_CX_TOOLS") or "").split(",") if t.strip())
+    for t in tools:
+        if not _TOOL_NAME.fullmatch(t):
+            raise SystemExit(f"GATEWAY_CX_TOOLS: {t!r} is not a tool name (<server>__<tool>)")
+    return timeout, turns, tools

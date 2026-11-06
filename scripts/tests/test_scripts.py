@@ -390,7 +390,9 @@ def test_build_images_restarts_nothing_when_not_installed_or_on_another_cluster(
 GCP = SCRIPTS.parent / "deploy" / "gcp"
 LLM_KEY = "gsk_" + "Q" * 40  # one repeated character: the repository's secret scan treats these as placeholders
 CK, CS = "ck_" + "1" * 40, "cs_" + "2" * 40
-DEPLOY = {"WOO_BASE_URL": "https://shop.example.com", "ADMIN_EMAIL": "owner@example.com"}
+WOO_ON_CLOUD_RUN = {"WOO_BASE_URL": "https://shop.example.com", "ADMIN_EMAIL": "owner@example.com"}
+WOO_ON_HP = {"WOO_MCP_URL": "https://woo-mcp.tail1234.ts.net/mcp", "ADMIN_EMAIL": "owner@example.com"}
+HP_TOKEN = "ab" * 24  # the HP's woo-mcp token: 48 hex characters, as bootstrap-secrets.sh makes it
 SECRET_NAMES = ["gateway-env", "woo-mcp-token", "gst-mcp-token", "woo-consumer-key", "woo-consumer-secret"]
 
 
@@ -435,9 +437,11 @@ def test_gcp_secrets_makes_five_values_in_one_region_in_the_shapes_the_services_
     r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{CK}\n{CS}\n")
     assert r.returncode == 0, r.stderr
     gw = gateway_env(env)
-    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY"}
+    assert set(gw) == {"GATEWAY_SECRET_KEY", "GATEWAY_ADMIN_KEY", "GATEWAY_LLM_API_KEY", "ADK_AGENT_KEY", "CX_AGENT_KEY"}
     Fernet(gw["GATEWAY_SECRET_KEY"].encode())  # raises if it is not a valid key for the gateway's encryption
     assert parse_key(gw["GATEWAY_ADMIN_KEY"]) is not None and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY
+    keys = [gw[k] for k in ("GATEWAY_ADMIN_KEY", "ADK_AGENT_KEY", "CX_AGENT_KEY")]
+    assert all(parse_key(k) for k in keys) and len(set(keys)) == 3  # every user its own key
     woo, gst = gcp_secret(env, "woo-mcp-token"), gcp_secret(env, "gst-mcp-token")
     assert re.fullmatch(r"[0-9a-f]{48}", woo) and re.fullmatch(r"[0-9a-f]{48}", gst) and woo != gst  # no "\n" at the end
     assert gcp_secret(env, "woo-consumer-key") == CK and gcp_secret(env, "woo-consumer-secret") == CS
@@ -481,7 +485,7 @@ def test_an_llm_key_added_later_keeps_the_other_values_and_leaves_one_billed_ver
 ])
 def test_gcp_secrets_refuses_a_bad_value_before_creating_anything(env, stdin, says):
     r = env.run("gcp-secrets.sh", stdin=stdin)
-    assert r.returncode != 0 and says in r.stderr and "nothing was created" in r.stderr
+    assert r.returncode != 0 and says in r.stderr and "nothing was changed" in r.stderr
     assert not gcloud_calls(env, "secrets create")
     for value in stdin.splitlines():  # every typed value, good or bad
         assert value not in r.stdout + r.stderr
@@ -489,20 +493,23 @@ def test_gcp_secrets_refuses_a_bad_value_before_creating_anything(env, stdin, sa
 
 @pytest.mark.parametrize("script, args", [("gcp-secrets.sh", []), ("gcp-deploy.sh", []), ("gcp-teardown.sh", ["--yes"])])
 def test_gcp_scripts_refuse_to_run_without_a_project(env, script, args):
-    r = env.run(script, *args, STUB_GCP_PROJECT="", **DEPLOY)
+    r = env.run(script, *args, STUB_GCP_PROJECT="", **WOO_ON_CLOUD_RUN)
     assert r.returncode != 0 and "GCP_PROJECT" in r.stderr
     assert not [c for c in env.calls("gcloud") if " create" in c or " delete" in c or " deploy" in c]
 
 
 def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_for_the_free_tier(env):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     calls = env.calls("gcloud")
-    [build] = gcloud_calls(env, "builds submit")
+    builds = gcloud_calls(env, "builds submit")
+    root = SCRIPTS.parent
+    assert [re.search(r"--config=(\S+)", b).group(1) for b in builds] == [
+        f"{root}/deploy/gcp/cloudbuild.yaml", f"{root}/deploy/gcp/cloudbuild-woo-mcp.yaml"]
     deploys = gcloud_calls(env, "run deploy")
-    assert [d.split()[3] for d in deploys] == ["woo-mcp", "gst", "gateway"]  # the gateway's seed needs their URLs
-    assert calls.index(build) < calls.index(deploys[0])
+    assert [d.split()[3] for d in deploys] == ["woo-mcp", "gst", "gateway", "dashboard"]  # each needs the URLs before it
+    assert calls.index(builds[-1]) < calls.index(deploys[0])
     for d in deploys:
         name = d.split()[3]
         for flag in ("--min-instances=0", "--cpu-throttling", "--allow-unauthenticated", "--region=us-central1",
@@ -511,7 +518,7 @@ def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_
         assert "--no-cpu-throttling" not in d  # that is instance billing: about $40 a month for an always-on gateway
         image = "gst-mcp" if name == "gst" else name
         assert re.search(rf"--image=us-central1-docker\.pkg\.dev/demo-proj/mcp/{image}:\d{{8}}-\d{{6}}-abc1234 ", d)
-    woo, gst, gw = deploys
+    woo, gst, gw, dash = deploys
     assert "--max-instances=2" in woo and "--max-instances=2" in gst
     assert "--max-instances=1" in gw  # one instance = one database
     assert "WOO_BASE_URL=https://shop.example.com" in woo and "WOO_CONSUMER_SECRET=woo-consumer-secret:latest" in woo
@@ -523,7 +530,7 @@ def test_gcp_deploy_builds_then_deploys_the_upstreams_before_the_gateway_set_up_
 
 def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     text = (env.state / "gcloud" / "vars" / "gateway.yaml").read_text()
     gw = yaml.safe_load(text)
@@ -533,6 +540,11 @@ def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env
     entries = load_seed(gw["GATEWAY_SEED_JSON"], {"WOO_MCP_TOKEN": "t1", "GST_MCP_TOKEN": "t2"})  # the gateway's loader
     assert [(e.slug, e.url, e.credential) for e in entries] == [
         ("woo", "https://woo-mcp-abc123-uc.a.run.app/mcp", "t1"), ("gst", "https://gst-abc123-uc.a.run.app/mcp", "t2")]
+    # the ADK agent's member user, seeded so its key survives the database being wiped (the key stays in gateway-env)
+    assert json.loads(gw["GATEWAY_SEED_JSON"])["users"] == [
+        {"email": "adk-agent@example.com", "role": "member", "key_env": "ADK_AGENT_KEY"},
+        {"email": "cx-agent@example.com", "role": "member", "key_env": "CX_AGENT_KEY"}]
+    assert gw["GATEWAY_CX_ENABLED"] == "1" and "GATEWAY_CX_TOOLS" not in gw  # no allowlist: every read-only tool
     seen = text + env.log.read_text() + r.stdout + r.stderr
     for value in every_gcp_secret_value(env):
         assert value not in seen
@@ -541,7 +553,7 @@ def test_gcp_deploy_gives_the_gateway_a_seed_it_accepts_and_no_secret_values(env
 
 def test_each_service_account_reads_only_its_own_secrets_and_has_no_project_role(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     own = {"gateway": ["gateway-env", "woo-mcp-token", "gst-mcp-token"],
            "woo-mcp": ["woo-mcp-token", "woo-consumer-key", "woo-consumer-secret"], "gst": ["gst-mcp-token"]}
     expected = sorted(f"{secret} serviceAccount:{sa}-run@demo-proj.iam.gserviceaccount.com "
@@ -552,7 +564,7 @@ def test_each_service_account_reads_only_its_own_secrets_and_has_no_project_role
 
 def test_gcp_deploy_sets_up_the_cost_guards(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     root = SCRIPTS.parent
     [policy] = gcloud_calls(env, "artifacts repositories set-cleanup-policies")
     assert f"--policy={root}/deploy/gcp/cleanup-policy.json" in policy and "--no-dry-run" in policy
@@ -560,13 +572,62 @@ def test_gcp_deploy_sets_up_the_cost_guards(env):
     assert "gs://demo-proj-build-source" in bucket and "--location=us-central1" in bucket
     [lifecycle] = gcloud_calls(env, "storage buckets update")
     assert f"--lifecycle-file={root}/deploy/gcp/build-source-lifecycle.json" in lifecycle
-    [build] = gcloud_calls(env, "builds submit")
-    assert f"--config={root}/deploy/gcp/cloudbuild.yaml" in build
-    assert "--gcs-source-staging-dir=gs://demo-proj-build-source/source" in build
+    builds = gcloud_calls(env, "builds submit")
+    assert builds and all("--gcs-source-staging-dir=gs://demo-proj-build-source/source" in b for b in builds)
     [budget] = gcloud_calls(env, "billing budgets create")
     for part in ("--budget-amount=1 ", "--filter-projects=projects/demo-proj", "--threshold-rule=percent=0.5",
                  "--threshold-rule=percent=1.0", "--display-name=demo-proj free-tier guard"):
         assert part in budget + " ", part
+
+
+# -- woo-mcp on the HP (WOO_MCP_URL): published with Tailscale Funnel, nothing of it in Google Cloud ---------------
+
+def hp_ready(env):
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{HP_TOKEN}\n", WOO_MCP_URL=WOO_ON_HP["WOO_MCP_URL"])
+    assert r.returncode == 0, r.stderr
+    env.log.write_text("")
+    return r
+
+
+def test_with_woo_mcp_on_the_hp_the_secrets_are_three_and_the_token_is_the_hps(env):
+    r = hp_ready(env)
+    assert gcp_secret(env, "woo-mcp-token") == HP_TOKEN  # typed, not made: a new token would never match the HP's
+    assert sorted(p.name for p in (env.state / "gcloud" / "secrets").iterdir()) == \
+           ["gateway-env", "gst-mcp-token", "woo-mcp-token"]  # the WooCommerce keys stay on the HP
+    assert HP_TOKEN not in r.stdout + r.stderr
+
+
+def test_a_token_pasted_still_in_base64_is_refused_before_anything_is_created(env):
+    import base64
+    pasted = base64.b64encode(HP_TOKEN.encode()).decode()  # kubectl's output without `| base64 -d`
+    r = env.run("gcp-secrets.sh", stdin=f"{LLM_KEY}\n{pasted}\n", WOO_MCP_URL=WOO_ON_HP["WOO_MCP_URL"])
+    assert r.returncode != 0 and "base64 -d" in r.stderr and pasted not in r.stdout + r.stderr
+    assert not gcloud_calls(env, "secrets create")
+
+
+def test_with_woo_mcp_on_the_hp_nothing_of_it_is_built_or_deployed_and_the_seed_points_at_the_hp(env):
+    hp_ready(env)
+    r = env.run("gcp-deploy.sh", **WOO_ON_HP)
+    assert r.returncode == 0, r.stderr
+    [build] = gcloud_calls(env, "builds submit")
+    assert f"--config={SCRIPTS.parent}/deploy/gcp/cloudbuild.yaml " in build + " "
+    assert [d.split()[3] for d in gcloud_calls(env, "run deploy")] == ["gst", "gateway", "dashboard"]
+    assert not [c for c in env.calls("gcloud") if "woo-mcp-run" in c or "woo-consumer" in c]
+    gw = yaml.safe_load((env.state / "gcloud" / "vars" / "gateway.yaml").read_text())
+    entries = load_seed(gw["GATEWAY_SEED_JSON"], {"WOO_MCP_TOKEN": HP_TOKEN, "GST_MCP_TOKEN": "t2"})
+    assert [(e.slug, e.url, e.credential) for e in entries] == [
+        ("woo", "https://woo-mcp.tail1234.ts.net/mcp", HP_TOKEN), ("gst", "https://gst-abc123-uc.a.run.app/mcp", "t2")]
+    assert sorted((env.state / "gcloud" / "iam.txt").read_text().splitlines()) == sorted(
+        f"{s} serviceAccount:{sa}-run@demo-proj.iam.gserviceaccount.com roles/secretmanager.secretAccessor"
+        for sa, s in [("gateway", "gateway-env"), ("gateway", "woo-mcp-token"), ("gateway", "gst-mcp-token"),
+                      ("gst", "gst-mcp-token")])
+    assert HP_TOKEN not in env.log.read_text() + r.stdout + r.stderr
+
+
+def test_with_woo_mcp_on_cloud_run_the_deploy_still_needs_the_store_keys(env):
+    hp_ready(env)  # secrets made for the HP: no WooCommerce keys in Google Cloud
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
+    assert r.returncode != 0 and "woo-consumer-key" in r.stderr and not gcloud_calls(env, "run deploy")
 
 
 def test_the_files_in_deploy_gcp_hold_what_the_scripts_promise():
@@ -576,57 +637,64 @@ def test_the_files_in_deploy_gcp_hold_what_the_scripts_promise():
     assert json.loads((GCP / "build-source-lifecycle.json").read_text()) == \
            {"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}
     build = yaml.safe_load((GCP / "cloudbuild.yaml").read_text())
-    # the same folders build-images.sh builds for Kubernetes, all three at once
+    woo = yaml.safe_load((GCP / "cloudbuild-woo-mcp.yaml").read_text())
+    # the same folders build-images.sh builds for Kubernetes; woo-mcp on its own, built only for Cloud Run
     assert [(s["id"], s["args"][-1], s["waitFor"]) for s in build["steps"]] == [
-        ("gateway", "backend", ["-"]), ("woo-mcp", "woo-mcp", ["-"]), ("gst-mcp", "upstreams/gst", ["-"])]
-    assert build["images"] == [f"${{_REPO}}/{s['id']}:${{_TAG}}" for s in build["steps"]]
-    assert build["options"] == {"logging": "CLOUD_LOGGING_ONLY"}  # and no machineType: the free minutes need the default
+        ("gateway", "backend", ["-"]), ("gst-mcp", "upstreams/gst", ["-"]), ("dashboard", "frontend", ["-"])]
+    assert build["steps"][2]["args"][:3] == ["build", "--target", "cloudrun"]  # the dashboard's Cloud Run stage
+    assert [(s["id"], s["args"][-1]) for s in woo["steps"]] == [("woo-mcp", "woo-mcp")]
+    for config in (build, woo):
+        assert config["images"] == [f"${{_REPO}}/{s['id']}:${{_TAG}}" for s in config["steps"]]
+        assert config["options"] == {"logging": "CLOUD_LOGGING_ONLY"}  # no machineType: the free minutes need the default
     ignore = (SCRIPTS.parent / ".gcloudignore").read_text().splitlines()
     assert "#!include:.gitignore" in ignore and ".git" in ignore  # secrets and private notes never leave the Mac
 
 
 def test_gcp_deploy_run_again_creates_nothing_new_and_deploys_new_revisions(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     env.log.write_text("")
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0, r.stderr
     assert not [c for c in env.calls("gcloud") if re.match(r"gcloud \S+ \S+ create", c)]
-    assert len(gcloud_calls(env, "run deploy")) == 3 and "already exists" in r.stdout  # the budget
+    assert len(gcloud_calls(env, "run deploy")) == 4 and "already exists" in r.stdout  # the budget
 
 
 def test_gcp_deploy_only_warns_when_the_budget_alert_cannot_be_made(env):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", STUB_BUDGETS_FAIL="1", **DEPLOY)
+    r = env.run("gcp-deploy.sh", STUB_BUDGETS_FAIL="1", **WOO_ON_CLOUD_RUN)
     assert r.returncode == 0 and "could not set up the budget alert" in r.stderr
-    assert len(gcloud_calls(env, "run deploy")) == 3
+    assert len(gcloud_calls(env, "run deploy")) == 4
 
 
 def test_gcp_deploy_marks_images_built_from_uncommitted_changes(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", STUB_GIT_STATUS=" M backend/src/gateway/seed.py\n", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", STUB_GIT_STATUS=" M backend/src/gateway/seed.py\n", **WOO_ON_CLOUD_RUN).returncode == 0
     assert all(re.search(r":\d{8}-\d{6}-abc1234-dirty ", d) for d in gcloud_calls(env, "run deploy"))
 
 
 @pytest.mark.parametrize("change, says", [
-    ({"WOO_BASE_URL": None}, "set WOO_BASE_URL"),
+    ({"WOO_BASE_URL": None}, "say where woo-mcp runs"),
+    ({"WOO_MCP_URL": "https://woo-mcp.tail1234.ts.net/mcp"}, "not both"),
+    ({"WOO_BASE_URL": None, "WOO_MCP_URL": "http://woo-mcp.tail1234.ts.net/mcp"}, "WOO_MCP_URL must start with https://"),
     ({"WOO_BASE_URL": "http://shop.example.com"}, "must start with https://"),
     ({"WOO_BASE_URL": "https://shop.example.com,EVIL=1"}, "WOO_BASE_URL"),
     ({"ADMIN_EMAIL": None}, "set ADMIN_EMAIL"),
     ({"ADMIN_EMAIL": "x'@example.com"}, "ADMIN_EMAIL"),
     ({"LLM_MODEL": "a,b"}, "LLM_MODEL"),
     ({"GCP_TAG": "-bad tag"}, "GCP_TAG"),
+    ({"CX_TOOLS": "woo__x,EVIL=1"}, "CX_TOOLS"),
     ({"STUB_BILLING_ACCOUNT": ""}, "no billing account"),
 ])
 def test_gcp_deploy_stops_before_changing_anything_when_a_setting_is_wrong(env, change, says):
     gcp_ready(env)
-    r = env.run("gcp-deploy.sh", **{**DEPLOY, **change})
+    r = env.run("gcp-deploy.sh", **{**WOO_ON_CLOUD_RUN, **change})
     assert r.returncode != 0 and says in r.stderr
     assert not [c for c in env.calls("gcloud") if re.match(r"gcloud (services|builds|run|\S+ \S+ create)", c)]
 
 
 def test_gcp_deploy_stops_when_a_secret_is_missing_and_says_how_to_make_it(env):
-    r = env.run("gcp-deploy.sh", **DEPLOY)
+    r = env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN)
     assert r.returncode != 0 and "gcp-secrets.sh" in r.stderr
     assert not gcloud_calls(env, "builds submit") and not gcloud_calls(env, "run deploy")
 
@@ -639,12 +707,288 @@ def test_gcp_teardown_deletes_nothing_unless_delete_is_typed(env, answer):
 
 def test_gcp_teardown_deletes_the_services_and_keeps_the_secrets(env):
     gcp_ready(env)
-    assert env.run("gcp-deploy.sh", **DEPLOY).returncode == 0
+    assert env.run("gcp-deploy.sh", **WOO_ON_CLOUD_RUN).returncode == 0
     r = env.run("gcp-teardown.sh", stdin="delete\n")
     assert r.returncode == 0, r.stderr
-    assert [c.split()[4] for c in gcloud_calls(env, "run services delete")] == ["gateway", "woo-mcp", "gst"]
+    assert [c.split()[4] for c in gcloud_calls(env, "run services delete")] == ["gateway", "woo-mcp", "gst", "dashboard"]
     assert not [c for c in env.calls("gcloud") if "secrets delete" in c or "destroy" in c or "repositories delete" in c]
     assert all((env.state / "gcloud" / "secrets" / n).is_dir() for n in SECRET_NAMES)
     r = env.run("gcp-teardown.sh", "--yes")  # nothing left to delete: fine
-    assert r.returncode == 0 and r.stdout.count("not found (fine)") == 3
+    assert r.returncode == 0 and r.stdout.count("not found (fine)") == 4
     assert env.run("gcp-teardown.sh", "--force").returncode != 0
+
+
+# -- tailscale-operator.sh (on the HP) ----------------------------------------------------------------------------
+
+TS_ID, TS_SECRET = "kAbCdEf123", "tskey-client-kAbCdEf123-" + "Z" * 30
+
+
+def test_tailscale_operator_stores_the_oauth_client_as_a_secret_then_installs_the_chart_without_it(env):
+    r = env.run("tailscale-operator.sh", stdin=f"{TS_ID}\n{TS_SECRET}\n")
+    assert r.returncode == 0, r.stderr
+    assert env.secret("tailscale", "operator-oauth") == {"client_id": TS_ID, "client_secret": TS_SECRET}
+    calls = env.calls()
+    install = "helm upgrade --install tailscale-operator tailscale/tailscale-operator -n tailscale --wait"
+    assert install in calls  # no credentials given to helm: the chart reads tailscale/operator-oauth
+    assert calls.index(install) > max(i for i, c in enumerate(calls) if "create secret generic operator-oauth" in c)
+    assert "helm repo add tailscale https://pkgs.tailscale.com/helmcharts --force-update" in calls
+    assert TS_SECRET not in env.log.read_text() + r.stdout + r.stderr  # never on a command line, never shown
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_tailscale_operator_keeps_an_existing_secret_and_pins_a_version_when_asked(env):
+    env.add_secret("tailscale", "operator-oauth", client_id="old", client_secret="tskey-client-old")
+    r = env.run("tailscale-operator.sh", stdin="", TAILSCALE_OPERATOR_VERSION="1.80.0")
+    assert r.returncode == 0 and "already exists" in r.stdout
+    assert env.secret("tailscale", "operator-oauth")["client_id"] == "old"
+    assert any(c.endswith("-n tailscale --wait --version 1.80.0") for c in env.calls("helm"))
+
+
+@pytest.mark.parametrize("stdin, context, says", [
+    (f"{TS_ID}\nnot-a-client-secret\n", "k3d-wc", "tskey-client-"),
+    ("\n\n", "k3d-wc", "OAuth client id"),
+    (f"{TS_ID}\n{TS_SECRET}\n", "production", "production"),
+])
+def test_tailscale_operator_refuses_without_storing_or_installing_anything(env, stdin, context, says):
+    r = env.run("tailscale-operator.sh", stdin=stdin, STUB_CONTEXT=context)
+    assert r.returncode != 0 and says in r.stderr
+    assert env.secret("tailscale", "operator-oauth") is None
+    assert not [c for c in env.calls("helm") if "upgrade" in c]
+    assert "not-a-client-secret" not in r.stdout + r.stderr
+
+
+# -- the ADK agent's key (adk-agent/) in gateway-env -----------------------------------------------------------
+
+def old_gateway_env(env, text):
+    """A gateway-env made before the ADK agent existed: version 1, no ADK_AGENT_KEY."""
+    folder = env.state / "gcloud" / "secrets" / "gateway-env"
+    folder.mkdir(parents=True)
+    (folder / "1").write_text(text)
+
+
+def test_an_older_gateway_env_gets_the_agents_key_and_keeps_everything_else(env):
+    old = f"GATEWAY_SECRET_KEY=keep-me\nGATEWAY_ADMIN_KEY=wmcp_0123abcd_{'e' * 64}\nGATEWAY_LLM_API_KEY={LLM_KEY}\n"
+    old_gateway_env(env, old)
+    r = env.run("gcp-secrets.sh", stdin=f"{HP_TOKEN}\n", WOO_MCP_URL=WOO_ON_HP["WOO_MCP_URL"])
+    assert r.returncode == 0, r.stderr
+    gw = gateway_env(env)
+    assert gw["GATEWAY_SECRET_KEY"] == "keep-me" and gw["GATEWAY_LLM_API_KEY"] == LLM_KEY  # nothing else changed
+    assert parse_key(gw["ADK_AGENT_KEY"]) is not None
+    assert gcp_versions(env, "gateway-env") == ([2], [1])  # one billed version
+    assert parse_key(gw["CX_AGENT_KEY"]) is not None
+    assert "added ADK_AGENT_KEY CX_AGENT_KEY to gateway-env" in r.stdout
+    assert gw["ADK_AGENT_KEY"] not in r.stdout + r.stderr and gw["CX_AGENT_KEY"] not in r.stdout + r.stderr
+
+
+def test_gcp_deploy_will_not_seed_an_agent_whose_key_is_missing(env):
+    """The seed names ADK_AGENT_KEY: a gateway-env without it would make the gateway refuse to start."""
+    old_gateway_env(env, f"GATEWAY_SECRET_KEY=k\nGATEWAY_ADMIN_KEY=wmcp_0123abcd_{'e' * 64}\n")
+    for name in ("woo-mcp-token", "gst-mcp-token"):
+        (env.state / "gcloud" / "secrets" / name).mkdir(parents=True)
+        (env.state / "gcloud" / "secrets" / name / "1").write_text("ab" * 24)
+    r = env.run("gcp-deploy.sh", **WOO_ON_HP)
+    assert r.returncode != 0 and "ADK_AGENT_KEY" in r.stderr and "gcp-secrets.sh" in r.stderr
+    assert not gcloud_calls(env, "builds submit") and not gcloud_calls(env, "run deploy")
+
+
+def test_gcp_deploy_passes_a_cx_allowlist_and_needs_the_cx_key_too(env):
+    hp_ready(env)
+    r = env.run("gcp-deploy.sh", CX_TOOLS="woo__list_products,gst__calculate_gst", **WOO_ON_HP)
+    assert r.returncode == 0, r.stderr
+    gw = yaml.safe_load((env.state / "gcloud" / "vars" / "gateway.yaml").read_text())
+    assert gw["GATEWAY_CX_TOOLS"] == "woo__list_products,gst__calculate_gst"
+    assert "/api/cx/webhook" in r.stdout
+    # a gateway-env with the ADK key but not the CX key: the seed would name a missing key, so nothing is deployed
+    env.log.write_text("")
+    folder = env.state / "gcloud" / "secrets" / "gateway-env"
+    newest = max(int(f.name) for f in folder.iterdir() if f.name.isdigit())
+    (folder / str(newest + 1)).write_text("".join(
+        line + "\n" for line in gateway_env_lines(env) if not line.startswith("CX_AGENT_KEY=")))
+    r = env.run("gcp-deploy.sh", **WOO_ON_HP)
+    assert r.returncode != 0 and "no CX_AGENT_KEY" in r.stderr and not gcloud_calls(env, "run deploy")
+
+
+def gateway_env_lines(env):
+    return gcp_secret(env, "gateway-env").splitlines()
+
+
+# -- gcp-observability.sh: logs-based metrics, a dashboard and an uptime check; no alert policies -------------------
+
+OBS = GCP / "observability"
+METRICS = sorted(p.stem for p in (OBS / "metrics").glob("*.yaml"))
+
+
+def deployed(env):
+    hp_ready(env)
+    assert env.run("gcp-deploy.sh", **WOO_ON_HP).returncode == 0
+    env.log.write_text("")
+
+
+def test_observability_creates_the_free_parts_once_and_never_an_alert(env):
+    deployed(env)
+    r = env.run("gcp-observability.sh")
+    assert r.returncode == 0, r.stderr
+    assert sorted(p.stem for p in (env.state / "gcloud" / "metrics").glob("*.yaml")) == METRICS == [
+        "gateway_auth_failures", "gateway_cx_turns", "gateway_tool_calls", "gateway_tool_latency"]
+    for name in METRICS:  # each made from its own file
+        assert (env.state / "gcloud" / "metrics" / f"{name}.yaml").read_text() == (OBS / "metrics" / f"{name}.yaml").read_text()
+    check = (env.state / "gcloud" / "uptime" / "gateway-health").read_text()
+    for part in ("--resource-labels=host=gateway-abc123-uc.a.run.app,project_id=demo-proj", "--protocol=https",
+                 "--path=/health", "--period=15"):
+        assert part in check, part
+    [dashboard] = (env.state / "gcloud" / "dashboards").glob("*.json")
+    assert json.loads(dashboard.read_text())["displayName"] == "MCP gateway"
+    assert not [c for c in env.calls("gcloud") if " policies " in c or " channels " in c]  # alerts are billed: none
+
+    env.log.write_text("")
+    r = env.run("gcp-observability.sh")  # again: metrics updated from their files, nothing made twice
+    assert r.returncode == 0, r.stderr
+    assert len(gcloud_calls(env, "logging metrics update")) == 4 and not gcloud_calls(env, "logging metrics create")
+    assert not gcloud_calls(env, "monitoring uptime create") and not gcloud_calls(env, "monitoring dashboards create")
+    assert len(list((env.state / "gcloud" / "dashboards").glob("*.json"))) == 1
+
+
+def test_observability_needs_a_deployed_gateway(env):
+    r = env.run("gcp-observability.sh")
+    assert r.returncode != 0 and "gcp-deploy.sh" in r.stderr
+    assert not gcloud_calls(env, "logging metrics") and not gcloud_calls(env, "monitoring uptime create")
+
+
+def test_teardown_also_removes_the_uptime_check_and_keeps_metrics_and_dashboard(env):
+    deployed(env)
+    assert env.run("gcp-observability.sh").returncode == 0
+    r = env.run("gcp-teardown.sh", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert "gcloud monitoring uptime delete gateway-health-id --project=demo-proj --quiet" in env.calls()
+    assert not (env.state / "gcloud" / "uptime" / "gateway-health").exists()
+    assert len(list((env.state / "gcloud" / "metrics").glob("*.yaml"))) == 4  # free to keep
+    assert not [c for c in env.calls("gcloud") if "metrics delete" in c or "dashboards delete" in c]
+
+
+def test_every_metric_is_well_formed_and_reads_only_the_gateways_own_log_lines():
+    for name in METRICS:
+        m = yaml.safe_load((OBS / "metrics" / f"{name}.yaml").read_text())
+        assert 'resource.labels.service_name="gateway"' in m["filter"], name  # never another service's logs
+        # a label the extractors fill must be declared, and the reverse: the API refuses a mismatch
+        assert set(m["labelExtractors"]) == {l["key"] for l in m["metricDescriptor"]["labels"]}, name
+        is_distribution = m["metricDescriptor"]["valueType"] == "DISTRIBUTION"
+        assert is_distribution == ("valueExtractor" in m) == ("bucketOptions" in m), name
+
+
+def gateway_log_lines(tmp_path) -> dict:
+    """One tool_call line and one cx_turn line, written by the gateway's own code through its JSON formatter."""
+    import asyncio
+    import logging
+    from gateway.audit.service import AuditLog
+    from gateway.cx import CxWebhook
+    from gateway.logs import JsonFormatter
+    from gateway.service import Caller
+
+    lines = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            lines.append(json.loads(JsonFormatter().format(record)))
+
+    handler = Keep(level=logging.INFO)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    old_level, root.level = root.level, logging.INFO
+    try:
+        AuditLog(f"sqlite:///{tmp_path / 'audit.db'}").record(
+            outcome="success", source="mcp", user_id="u1", key_id="ab12cd34", server_slug="woo", tool="list_orders",
+            duration_ms=12)
+        asyncio.run(CxWebhook(None, 1).handle(Caller("u2", "cx@example.com", "cd34ef56", "cx"),
+                                              {"text": "hi", "sessionInfo": {"session": "a/sessions/s1"}}))
+    finally:
+        root.removeHandler(handler)
+        root.level = old_level
+    return {line["event"]: line for line in lines if "event" in line}
+
+
+def test_every_log_field_a_metric_reads_is_one_the_gateway_really_logs(tmp_path):
+    """Rename a field in the gateway's log lines and this fails, instead of a metric silently counting nothing."""
+    lines = gateway_log_lines(tmp_path)
+    assert set(lines) == {"tool_call", "cx_turn"}
+    for name in METRICS:
+        text = (OBS / "metrics" / f"{name}.yaml").read_text()
+        event = re.search(r'jsonPayload\.event="([a-z_]+)"', text).group(1)
+        for field in set(re.findall(r"jsonPayload\.([a-z_]+)", text)):
+            assert field in lines[event], (name, field)
+
+
+def test_the_dashboard_charts_our_metrics_and_fits_its_grid():
+    board = json.loads((OBS / "dashboard.json").read_text())
+    tiles = board["mosaicLayout"]["tiles"]
+    used = {m for t in tiles for ds in t["widget"]["xyChart"]["dataSets"]
+            for m in re.findall(r'metric\.type="([^"]+)"', ds["timeSeriesQuery"]["timeSeriesFilter"]["filter"])}
+    ours = {m.removeprefix("logging.googleapis.com/user/") for m in used if m.startswith("logging.googleapis.com/user/")}
+    assert ours == set(METRICS)  # every metric is charted, and no chart names one that does not exist
+    assert used - {f"logging.googleapis.com/user/{m}" for m in METRICS} == {
+        "monitoring.googleapis.com/uptime_check/check_passed", "run.googleapis.com/request_count",
+        "run.googleapis.com/container/instance_count"}  # built-in metrics
+    cells = set()
+    for t in tiles:
+        assert t["widget"]["title"] and 0 <= t["xPos"] and t["xPos"] + t["width"] <= 48
+        area = {(x, y) for x in range(t["xPos"], t["xPos"] + t["width"]) for y in range(t["yPos"], t["yPos"] + t["height"])}
+        assert not cells & area  # no two charts on top of each other
+        cells |= area
+
+
+
+# -- the dashboard on Cloud Run: nginx forwards /api to the gateway ----------------------------------------------
+
+FRONTEND = SCRIPTS.parent / "frontend"
+TEMPLATE = (FRONTEND / "nginx.cloudrun.conf.template").read_text()
+NGINX_VARS = ("$uri", "$gateway", "$proxy_add_x_forwarded_for")  # nginx's own: envsubst must never touch them
+
+
+def dockerfile_stages() -> list[str]:
+    return re.split(r"(?m)^FROM ", (FRONTEND / "Dockerfile").read_text())[1:]
+
+
+def test_the_dashboard_is_deployed_after_the_gateway_pointing_at_it_with_no_permissions(env):
+    hp_ready(env)
+    assert env.run("gcp-deploy.sh", **WOO_ON_HP).returncode == 0
+    gateway, dashboard = gcloud_calls(env, "run deploy")[-2:]
+    assert gateway.split()[3] == "gateway" and dashboard.split()[3] == "dashboard"
+    assert "--set-env-vars=GATEWAY_URL=https://gateway-abc123-uc.a.run.app,GATEWAY_HOST=gateway-abc123-uc.a.run.app" in dashboard
+    assert "--service-account=dashboard-run@demo-proj.iam.gserviceaccount.com" in dashboard and "--set-secrets" not in dashboard
+    assert "--max-instances=2" in dashboard and "--min-instances=0" in dashboard
+    assert "dashboard-run" not in (env.state / "gcloud" / "iam.txt").read_text()  # it may read no secret at all
+
+
+def test_kubernetes_still_builds_the_plain_dashboard_and_cloud_run_its_own_stage():
+    *_, cloudrun, kubernetes = dockerfile_stages()
+    assert cloudrun.startswith("nginxinc/nginx-unprivileged:1.28-alpine AS cloudrun")
+    assert "COPY nginx.cloudrun.conf.template /etc/nginx/templates/default.conf.template" in cloudrun
+    assert kubernetes.startswith("nginxinc/nginx-unprivileged:1.28-alpine\n")  # the last stage: what build-images.sh gets
+    assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in kubernetes and "template" not in kubernetes
+
+
+def test_only_the_three_settings_are_filled_in_and_nginx_variables_are_left_alone():
+    *_, cloudrun, _ = dockerfile_stages()
+    pattern = re.search(r'NGINX_ENVSUBST_FILTER="([^"]+)"', cloudrun).group(1)  # the image's envsubst filter (awk ERE)
+    placeholders = set(re.findall(r"\$\{([A-Z_]+)\}", TEMPLATE))
+    assert placeholders == {"GATEWAY_URL", "GATEWAY_HOST", "NGINX_LOCAL_RESOLVERS"}
+    assert all(re.search(pattern, name) for name in placeholders)
+    assert not any(re.search(pattern, v.lstrip("$")) for v in NGINX_VARS)
+    filled = TEMPLATE
+    for name, value in {"GATEWAY_URL": "https://gw.a.run.app", "GATEWAY_HOST": "gw.a.run.app",
+                        "NGINX_LOCAL_RESOLVERS": "169.254.169.254"}.items():
+        filled = filled.replace("${%s}" % name, value)
+    assert "${" not in filled and all(v in filled for v in NGINX_VARS)
+    assert "set $gateway https://gw.a.run.app;" in filled and "proxy_set_header Host gw.a.run.app;" in filled
+
+
+def test_the_cloud_run_dashboard_serves_what_kubernetes_serves_and_forwards_only_api_securely():
+    kubernetes = (FRONTEND / "nginx.conf").read_text()
+    lines = lambda text, start: [l.strip() for l in text.splitlines() if l.strip().startswith(start)]
+    assert lines(TEMPLATE, "add_header") == lines(kubernetes, "add_header")  # the same security headers
+    static = lambda text: re.findall(r"location (= /|/assets/|/) \{([^}]*)\}", text)
+    assert static(TEMPLATE) == static(kubernetes)  # the same files, cached the same way
+    api = re.search(r"location /api/ \{(.*?)\n    \}", TEMPLATE, re.S).group(1)  # ${...} has braces of its own
+    for setting in ("proxy_pass $gateway;", "proxy_ssl_verify on;", "proxy_ssl_server_name on;",
+                    "proxy_set_header Host ${GATEWAY_HOST};", "proxy_read_timeout 300s;"):
+        assert setting in api, setting
+    assert "/mcp" not in TEMPLATE.split("server {", 1)[1]  # MCP clients use the gateway's own address

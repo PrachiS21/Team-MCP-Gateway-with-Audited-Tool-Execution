@@ -1,0 +1,14 @@
+# Requests refused because of their API key (wrong, revoked, or its user deactivated): a spike means someone is
+# guessing keys or a client still uses a revoked one. The line carries only the key's public id, never the key.
+description: Requests refused because of their API key, by source
+filter: >-
+  resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
+  AND jsonPayload.event="tool_call" AND jsonPayload.outcome="auth_failed"
+labelExtractors:
+  source: EXTRACT(jsonPayload.source)
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - {key: source, valueType: STRING, description: "mcp (Claude Code and other MCP clients), api (dashboard login) or cx"}

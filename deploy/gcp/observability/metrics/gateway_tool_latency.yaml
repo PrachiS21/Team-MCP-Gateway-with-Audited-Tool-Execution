@@ -1,0 +1,19 @@
+# How long finished tool calls took, end to end through the gateway (duration_ms of each "tool_call" line).
+# Calls the gateway refused before running them (a bad key, no permission) are left out: they took no time.
+description: Duration of finished tool calls in milliseconds, by server and outcome
+filter: >-
+  resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
+  AND jsonPayload.event="tool_call" AND jsonPayload.outcome!="auth_failed" AND jsonPayload.outcome!="denied"
+valueExtractor: EXTRACT(jsonPayload.duration_ms)
+labelExtractors:
+  server: EXTRACT(jsonPayload.server)
+  outcome: EXTRACT(jsonPayload.outcome)
+metricDescriptor:
+  metricKind: DELTA
+  valueType: DISTRIBUTION
+  unit: ms
+  labels:
+    - {key: server, valueType: STRING, description: "the upstream server's slug"}
+    - {key: outcome, valueType: STRING, description: "success, tool_error or error"}
+bucketOptions:
+  exponentialBuckets: {numFiniteBuckets: 17, growthFactor: 2, scale: 1}  # 1 ms, 2 ms, 4 ms ... about 65 s

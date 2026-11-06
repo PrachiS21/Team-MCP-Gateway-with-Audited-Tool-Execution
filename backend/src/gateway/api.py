@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse, Response
 
 from gateway.audit.service import AuditLog
 from gateway.chat import ChatAgent, ChatInputError, LLMError
+from gateway.cx import CxWebhook
 from gateway.auth.keys import parse_key
 from gateway.auth.service import ROLES, SESSION_TTL, AuthService, User
 from gateway.mcp.manager import UpstreamManager
@@ -87,14 +88,30 @@ async def _json_body(request: Request) -> dict:
 
 
 def register_api(mcp: FastMCP, *, auth: AuthService, registry: ServerRegistry, audit: AuditLog,
-                 manager: UpstreamManager, service: GatewayService,
-                 cookie_secure: bool = False, chat: ChatAgent | None = None) -> list[tuple[str, str, str]]:
-    """Adds the /api routes to the server and returns them as (method, path, access); the tests walk that list."""
+                 manager: UpstreamManager, service: GatewayService, cookie_secure: bool = False,
+                 chat: ChatAgent | None = None, cx: CxWebhook | None = None) -> list[tuple[str, str, str]]:
+    """Adds the /api routes to the server and returns them as (method, path, access); the tests walk that list.
+    The CX webhook route exists only when `cx` is given (GATEWAY_CX_ENABLED)."""
     routes: list[tuple[str, str, str]] = []
 
     def me_of(request: Request) -> Me | None:
         found = auth.session_user(request.cookies.get(COOKIE, ""))
         return Me(*found) if found else None
+
+    def key_holder(request: Request, source: str) -> Me | None:
+        """For callers that are programs, not browsers (Dialogflow CX): "Authorization: Bearer <API key>", checked like
+        a key on /mcp. No cookie is involved, so cross-site request forgery does not apply."""
+        header = request.headers.get("authorization", "")
+        token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        user = auth.verify(token) if token else None
+        if user is not None:
+            return Me(user, parse_key(token))
+        try:  # the same trail as a rejected /mcp call; only the public key id, never the key
+            audit.record(outcome="auth_failed", source=source, key_id=parse_key(token) if token else None,
+                         error_kind="invalid_key")
+        except Exception:  # noqa: BLE001
+            log.exception("could not record failed authentication")
+        return None
 
     def event(me: Me, action: str, server_slug: str | None = None, **details) -> None:
         """Record an admin action (never with a secret in it). The action already happened, so a failure is logged."""
@@ -103,17 +120,22 @@ def register_api(mcp: FastMCP, *, auth: AuthService, registry: ServerRegistry, a
         except Exception:  # noqa: BLE001
             log.exception("could not record admin event %s", action)
 
-    def route(path: str, method: str, access: str = "user"):
-        """access: "public" (no login), "user" (any logged-in user) or "admin"."""
+    def route(path: str, method: str, access: str = "user", source: str = "api"):
+        """access: "public" (no login), "user" (any logged-in user), "admin", or "key" (an API key in the Authorization
+        header instead of a session; a rejected key is audited with `source`)."""
         routes.append((method, path, access))
 
         def wrap(handler: Callable[..., Awaitable[Any]]):
             async def endpoint(request: Request) -> Response:
                 try:
+                    me = None
+                    if access == "key":  # checked before the body is read: a stranger's body is never parsed
+                        me = key_holder(request, source)
+                        if me is None:
+                            raise ApiError(401, "unauthenticated", "send Authorization: Bearer <API key>")
                     if method in ("POST", "PATCH"):
                         request.state.body = await _json_body(request)
-                    me = None
-                    if access != "public":
+                    if access in ("user", "admin"):
                         me = me_of(request)
                         if me is None:
                             raise ApiError(401, "unauthenticated", "log in first")
@@ -376,5 +398,16 @@ def register_api(mcp: FastMCP, *, auth: AuthService, registry: ServerRegistry, a
         except LLMError as exc:
             raise ApiError(502, "llm_error", str(exc)) from None
         return reply.as_json()
+
+    # -- Dialogflow CX ----------------------------------------------------------------------------------------------------
+
+    if cx is not None:
+        @route("/api/cx/webhook", "POST", "key", source="cx")
+        async def cx_webhook(request, me):
+            """A customer's message from a Dialogflow CX agent (see cx.py). The key belongs to a member, the CX
+            channel's own user: its tool calls are audited under that user with source "cx"."""
+            if me.user.is_admin:  # the key sits in the CX agent's settings at Google: never an admin's
+                raise ApiError(403, "forbidden", "the CX webhook takes a member's key, not an admin's")
+            return await cx.handle(me.caller("cx"), request.state.body)
 
     return routes

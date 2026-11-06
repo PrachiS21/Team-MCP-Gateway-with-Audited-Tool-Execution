@@ -1,13 +1,22 @@
 #!/bin/sh
-# Builds the images with Cloud Build and deploys woo-mcp, gst and the gateway to Cloud Run, set up to stay inside the
-# free tiers (each step says how). The dashboard joins once it has a Cloud Run proxy config.
+# Builds the images with Cloud Build and deploys gst, the gateway, the dashboard and (when asked) woo-mcp to Cloud Run,
+# set up to stay inside the free tiers (each step says how).
 # Needs: gcloud, logged in (gcloud auth login); a project with a billing account linked (the free tiers still need
-# one); the secrets from scripts/gcp-secrets.sh; the store reachable at a public HTTPS address.
+# one); the secrets from scripts/gcp-secrets.sh, made with the same WOO_MCP_URL.
 # Safe to run again: each step creates only what is missing, then every service gets a new revision.
 #
-#   WOO_BASE_URL=https://shop.example.com ADMIN_EMAIL=you@example.com scripts/gcp-deploy.sh
+# Where woo-mcp runs (give exactly one):
+#   WOO_MCP_URL=https://woo-mcp.<tailnet>.ts.net/mcp   woo-mcp stays on the HP next to the store, published with
+#       Tailscale Funnel (store chart: publicMcp). Nothing is built or deployed for it; the gateway's seed points there.
+#       The store's API and its WooCommerce keys never leave the HP.
+#   WOO_BASE_URL=https://shop.example.com              woo-mcp runs on Cloud Run and calls a store that has its own
+#       public HTTPS address (a VPS, say).
 #
-# Settings: WOO_BASE_URL and ADMIN_EMAIL (required); LLM_MODEL (default openai/gpt-oss-120b, as values-local.yaml);
+#   WOO_MCP_URL=https://woo-mcp.<tailnet>.ts.net/mcp ADMIN_EMAIL=you@example.com scripts/gcp-deploy.sh
+#
+# Other settings: ADMIN_EMAIL (required); ADK_AGENT_EMAIL and CX_AGENT_EMAIL (the members whose keys are ADK_AGENT_KEY
+# and CX_AGENT_KEY in gateway-env; default adk-agent@ / cx-agent@example.com); CX_TOOLS (optional: the tools the
+# CX webhook may use, comma-separated <server>__<tool>; read-only ones only, whatever is listed); LLM_MODEL (default openai/gpt-oss-120b, as values-local.yaml);
 # STORE_TIMEZONE (default Asia/Kolkata); STORE_STATE (gst's home state, default MH); BUDGET (alert amount in the
 # billing account's currency, default 1); GCP_PROJECT, GCP_REGION, GCP_REPO (gcp-lib.sh); GCP_TAG (image tag).
 #
@@ -25,6 +34,9 @@ PROJECT="$(gcp_project)"
 
 WOO_BASE_URL="${WOO_BASE_URL:-}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-}"
+ADK_AGENT_EMAIL="${ADK_AGENT_EMAIL:-adk-agent@example.com}"
+CX_AGENT_EMAIL="${CX_AGENT_EMAIL:-cx-agent@example.com}"
+CX_TOOLS="${CX_TOOLS:-}"
 LLM_MODEL="${LLM_MODEL:-openai/gpt-oss-120b}"
 STORE_TIMEZONE="${STORE_TIMEZONE:-Asia/Kolkata}"
 STORE_STATE="${STORE_STATE:-MH}"
@@ -32,14 +44,30 @@ BUDGET="${BUDGET:-1}"
 
 # -- 0. Check every setting before changing anything. None of them may hold a comma or a quote: they end up in
 #       gcloud's comma-separated lists and in single-quoted YAML.
-[ -n "$WOO_BASE_URL" ] || die "set WOO_BASE_URL to the store's public HTTPS address, e.g. WOO_BASE_URL=https://shop.example.com"
-case "$WOO_BASE_URL" in
-  https://*) ;;
-  *) die "WOO_BASE_URL must start with https://: woo-mcp sends the store's API key with every request" ;;
-esac
-valid WOO_BASE_URL "$WOO_BASE_URL" 'https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?'
+if [ -n "$WOO_MCP_URL" ] && [ -n "$WOO_BASE_URL" ]; then
+  die "set WOO_MCP_URL (woo-mcp on the HP) or WOO_BASE_URL (woo-mcp on Cloud Run), not both"
+elif [ -n "$WOO_MCP_URL" ]; then
+  case "$WOO_MCP_URL" in
+    https://*) ;;
+    *) die "WOO_MCP_URL must start with https://: the gateway sends woo-mcp's token with every request" ;;
+  esac
+  valid WOO_MCP_URL "$WOO_MCP_URL" 'https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/-]*'
+  WOO_ON_CLOUD_RUN=0
+elif [ -n "$WOO_BASE_URL" ]; then
+  case "$WOO_BASE_URL" in
+    https://*) ;;
+    *) die "WOO_BASE_URL must start with https://: woo-mcp sends the store's API key with every request" ;;
+  esac
+  valid WOO_BASE_URL "$WOO_BASE_URL" 'https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?'
+  WOO_ON_CLOUD_RUN=1
+else
+  die "say where woo-mcp runs: WOO_MCP_URL=https://woo-mcp.<tailnet>.ts.net/mcp (on the HP) or WOO_BASE_URL=https://<store> (woo-mcp on Cloud Run)"
+fi
 [ -n "$ADMIN_EMAIL" ] || die "set ADMIN_EMAIL to the first admin's email (their key is GATEWAY_ADMIN_KEY in gateway-env)"
 valid ADMIN_EMAIL "$ADMIN_EMAIL" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+'
+valid ADK_AGENT_EMAIL "$ADK_AGENT_EMAIL" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+'
+valid CX_AGENT_EMAIL "$CX_AGENT_EMAIL" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+'
+valid CX_TOOLS "$CX_TOOLS" '([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?'
 valid LLM_MODEL "$LLM_MODEL" '[A-Za-z0-9._/:-]+'
 valid STORE_TIMEZONE "$STORE_TIMEZONE" '[A-Za-z0-9_/+-]+'
 valid STORE_STATE "$STORE_STATE" '[A-Z]{2}'
@@ -64,8 +92,15 @@ log "enabling the APIs (quick when they are already on)"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
   secretmanager.googleapis.com iam.googleapis.com billingbudgets.googleapis.com --project="$PROJECT"
 
-for s in $GCP_SECRETS; do
-  secret_exists "$s" || die "secret $s does not exist: run scripts/gcp-secrets.sh first"
+NEEDED="$GCP_SECRETS"
+if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then NEEDED="$NEEDED $GCP_STORE_SECRETS"; fi
+for s in $NEEDED; do
+  secret_exists "$s" || die "secret $s does not exist: run scripts/gcp-secrets.sh first (with the same WOO_MCP_URL)"
+done
+# The seed below names these keys; without one the gateway would refuse to start. The values go straight into grep.
+for name in ADK_AGENT_KEY CX_AGENT_KEY; do
+  gcloud secrets versions access latest --secret=gateway-env --project="$PROJECT" | grep -q "^$name=" \
+    || die "gateway-env has no $name yet: run scripts/gcp-secrets.sh again (it adds it and keeps the rest)"
 done
 
 # A budget alert: billing admins get an email at 50% and 100% of BUDGET. It only WARNS, it never stops spending;
@@ -125,15 +160,24 @@ service_account() {
   done
 }
 service_account gateway gateway-env woo-mcp-token gst-mcp-token
-service_account woo-mcp woo-mcp-token woo-consumer-key woo-consumer-secret
 service_account gst gst-mcp-token
+service_account dashboard  # no secrets: an account with no permissions at all, instead of the Editor default
+if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then service_account woo-mcp woo-mcp-token $GCP_STORE_SECRETS; fi
 
-# -- 5. Build the three images (deploy/gcp/cloudbuild.yaml). .gcloudignore keeps secrets and local files out of the
-#       upload. The free build minutes are for the default machine, which the config keeps.
+# -- 5. Build the images (deploy/gcp/cloudbuild.yaml; woo-mcp's own file only when it runs on Cloud Run).
+#       .gcloudignore keeps secrets and local files out of the upload. The free build minutes are for the default
+#       machine, which the configs keep.
 REPO_URL="$GCP_REGION-docker.pkg.dev/$PROJECT/$GCP_REPO"
-log "building gateway, woo-mcp and gst-mcp as :$TAG with Cloud Build (a few minutes)"
-gcloud builds submit "$ROOT" --project="$PROJECT" --config="$ROOT/deploy/gcp/cloudbuild.yaml" \
-  --substitutions="_REPO=$REPO_URL,_TAG=$TAG" --gcs-source-staging-dir="$BUCKET/source"
+build() {
+  gcloud builds submit "$ROOT" --project="$PROJECT" --config="$ROOT/deploy/gcp/$1" \
+    --substitutions="_REPO=$REPO_URL,_TAG=$TAG" --gcs-source-staging-dir="$BUCKET/source"
+}
+log "building gateway, gst-mcp and the dashboard as :$TAG with Cloud Build (a few minutes)"
+build cloudbuild.yaml
+if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then
+  log "building woo-mcp as :$TAG"
+  build cloudbuild-woo-mcp.yaml
+fi
 
 # -- 6. Deploy. Every service: no instance while idle (nothing billed); CPU only while a request is served
 #       (--cpu-throttling, the billing the free tier is for); a cap on instances, so a flood of requests cannot run up
@@ -148,21 +192,27 @@ url_of() { gcloud run services describe "$1" --project="$PROJECT" --region="$GCP
 
 # The upstream servers have public URLs (the gateway reaches them over the internet) and refuse any request without
 # their MCP_SERVER_TOKEN.
-deploy woo-mcp woo-mcp --max-instances=2 --timeout=60 \
-  --set-env-vars="WOO_BASE_URL=$WOO_BASE_URL,STORE_TIMEZONE=$STORE_TIMEZONE" \
-  --set-secrets="MCP_SERVER_TOKEN=woo-mcp-token:latest,WOO_CONSUMER_KEY=woo-consumer-key:latest,WOO_CONSUMER_SECRET=woo-consumer-secret:latest"
+if [ "$WOO_ON_CLOUD_RUN" = 1 ]; then
+  deploy woo-mcp woo-mcp --max-instances=2 --timeout=60 \
+    --set-env-vars="WOO_BASE_URL=$WOO_BASE_URL,STORE_TIMEZONE=$STORE_TIMEZONE" \
+    --set-secrets="MCP_SERVER_TOKEN=woo-mcp-token:latest,WOO_CONSUMER_KEY=woo-consumer-key:latest,WOO_CONSUMER_SECRET=woo-consumer-secret:latest"
+  WOO_URL="$(url_of woo-mcp)"
+  valid "woo-mcp's URL" "$WOO_URL" 'https://[a-z0-9.-]+'
+  WOO_MCP_URL="$WOO_URL/mcp"
+fi
 deploy gst gst-mcp --max-instances=2 --timeout=60 \
   --set-env-vars="STORE_STATE=$STORE_STATE" --set-secrets="MCP_SERVER_TOKEN=gst-mcp-token:latest"
-WOO_URL="$(url_of woo-mcp)"
 GST_URL="$(url_of gst)"
-valid "woo-mcp's URL" "$WOO_URL" 'https://[a-z0-9.-]+'
 valid "gst's URL" "$GST_URL" 'https://[a-z0-9.-]+'
 
-# The seed names the two servers at their Cloud Run URLs. It holds no secrets (the gateway refuses a seed that does),
-# only the names of the variables holding the tokens, so it can be plain config: GATEWAY_SEED_JSON.
-server() { printf '{"slug": "%s", "name": "%s", "url": "%s/mcp", "credential_type": "bearer", "credential_env": "%s"}' "$@"; }
-SEED="$(printf '{"servers": [%s, %s]}' "$(server woo 'WooCommerce (main)' "$WOO_URL" WOO_MCP_TOKEN)" \
-  "$(server gst 'GST calculator' "$GST_URL" GST_MCP_TOKEN)")"
+# The seed names the two servers (woo-mcp where it runs, gst at its Cloud Run URL) and the member users of the ADK
+# agent and the CX webhook, whose keys must survive the database being wiped when the gateway idles. It holds no secrets (the gateway refuses a
+# seed that does), only the names of the variables holding them, so it can be plain config.
+server() { printf '{"slug": "%s", "name": "%s", "url": "%s", "credential_type": "bearer", "credential_env": "%s"}' "$@"; }
+member() { printf '{"email": "%s", "role": "member", "key_env": "%s"}' "$@"; }
+SEED="$(printf '{"servers": [%s, %s], "users": [%s, %s]}' \
+  "$(server woo 'WooCommerce (main)' "$WOO_MCP_URL" WOO_MCP_TOKEN)" "$(server gst 'GST calculator' "$GST_URL/mcp" GST_MCP_TOKEN)" \
+  "$(member "$ADK_AGENT_EMAIL" ADK_AGENT_KEY)" "$(member "$CX_AGENT_EMAIL" CX_AGENT_KEY)")"
 
 # A YAML file rather than --set-env-vars, whose commas would split the JSON. Every value was checked above and none
 # can hold a single quote, so single-quoted YAML is safe.
@@ -174,19 +224,30 @@ GATEWAY_LLM_MODEL: '$LLM_MODEL'
 GATEWAY_LOG_FORMAT: json
 GATEWAY_GCP_PROJECT: '$PROJECT'
 GATEWAY_COOKIE_SECURE: '1'
+GATEWAY_CX_ENABLED: '1'
 EOF
+if [ -n "$CX_TOOLS" ]; then printf "GATEWAY_CX_TOOLS: '%s'\n" "$CX_TOOLS" >> "$WORK/gateway-vars.yaml"; fi
 
 # The gateway: at most ONE instance. Each instance has its own in-memory database, so a second one would be a second,
 # different database (log in on one, look logged out on the next request). gateway-env is mounted as a file, the two
-# upstream tokens are variables, and it cannot read the store's WooCommerce keys: only woo-mcp can. It is ready when
-# /ready answers (the database is up; the seed was applied before the port opened).
+# upstream tokens are variables, and it cannot read the store's WooCommerce keys (with woo-mcp on Cloud Run only
+# woo-mcp can; on the HP they are not in Google Cloud at all). It is ready when /ready answers (the database is up;
+# the seed was applied before the port opened).
 deploy gateway gateway --max-instances=1 --timeout=300 \
   --startup-probe=httpGet.path=/ready,httpGet.port=8080,periodSeconds=2,timeoutSeconds=2,failureThreshold=30 \
   --env-vars-file="$WORK/gateway-vars.yaml" \
   --set-secrets="/secrets/gateway/env=gateway-env:latest,WOO_MCP_TOKEN=woo-mcp-token:latest,GST_MCP_TOKEN=gst-mcp-token:latest"
 GW_URL="$(url_of gateway)"
 
-log "done. Gateway: $GW_URL   (MCP endpoint $GW_URL/mcp, health $GW_URL/health)"
+# The dashboard: static files, with /api/ forwarded to the gateway (frontend/nginx.cloudrun.conf.template). The
+# browser stays on one address, so the login cookie (SameSite=Strict, path /api) works as in Kubernetes.
+deploy dashboard dashboard --max-instances=2 --timeout=300 \
+  --set-env-vars="GATEWAY_URL=$GW_URL,GATEWAY_HOST=${GW_URL#https://}"
+DASHBOARD_URL="$(url_of dashboard)"
+
+log "done. Dashboard: $DASHBOARD_URL (log in with an API key)"
+log "Gateway: $GW_URL   (MCP endpoint $GW_URL/mcp, health $GW_URL/health); woo-mcp: $WOO_MCP_URL"
 log "the admin key, when you need it: gcloud secrets versions access latest --secret=gateway-env --project=$PROJECT | sed -n 's/^GATEWAY_ADMIN_KEY=//p'"
+log "Dialogflow CX webhook: $GW_URL/api/cx/webhook with the header Authorization: Bearer <CX_AGENT_KEY> (read it the same way)"
 log "Claude Code: claude mcp add --transport http gateway $GW_URL/mcp --header \"Authorization: Bearer <the admin key>\""
 log "after an idle spell the first request takes a few seconds: the services start from zero"

@@ -10,3 +10,4 @@ deploy/
 scripts/
 tests/
 upstreams/everything/
+adk-agent/

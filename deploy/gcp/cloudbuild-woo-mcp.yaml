@@ -1,0 +1,14 @@
+# Builds woo-mcp for Cloud Run. Used by scripts/gcp-deploy.sh only when woo-mcp runs there (WOO_MCP_URL unset);
+# when it runs on the HP next to the store, no image is built, which saves build minutes and registry space.
+# Same substitutions and options as cloudbuild.yaml.
+steps:
+  - id: woo-mcp
+    name: gcr.io/cloud-builders/docker
+    args: [build, -t, "${_REPO}/woo-mcp:${_TAG}", woo-mcp]
+
+images:
+  - "${_REPO}/woo-mcp:${_TAG}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1200s

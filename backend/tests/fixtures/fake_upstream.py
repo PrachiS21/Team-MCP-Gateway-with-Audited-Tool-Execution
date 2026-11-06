@@ -25,10 +25,13 @@ class FakeUpstream:
         tools: tuple[str, ...] = ("echo",),
         token: str | None = None,
         latency: float = 0.0,
+        annotations: dict[str, dict] | None = None,  # tool name -> MCP hints, e.g. {"readOnlyHint": True}
     ):
         self.name = name
         self.token = token
         self.latency = latency  # mutable at runtime
+        self.annotations = annotations or {}
+        self.calls: list[str] = []  # tool names, in the order they were called
         self.port = _free_port()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task | None = None
@@ -45,9 +48,11 @@ class FakeUpstream:
         upstream_name = self.name
 
         def handler(text: str = "") -> str:
+            self.calls.append(tool_name)
             return f"{upstream_name}:{tool_name}:{text}"
 
-        self.mcp.tool(handler, name=tool_name, description=f"{tool_name} from {upstream_name}")
+        self.mcp.tool(handler, name=tool_name, description=f"{tool_name} from {upstream_name}",
+                      annotations=self.annotations.get(tool_name))
 
     def _app(self):
         inner = self.mcp.http_app()

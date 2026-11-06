@@ -65,26 +65,94 @@ The host names contain the IP. Run `scripts/deploy-local.sh` again (it detects t
 the HP's address in the router (DHCP reservation) so it never changes.
 
 ## Cloud Run (Google Cloud, free tier)
-A second way to run the gateway, woo-mcp and gst, with no cluster. Run from the Mac. It needs `gcloud`, logged in
-(`gcloud auth login`), and a project with a billing account linked, because the free tiers still need one. The store
-stays where it is and must be reachable at a public HTTPS address.
+A second way to run the platform. The gateway, gst and the dashboard run on Cloud Run. The dashboard forwards `/api` to
+the gateway (`frontend/nginx.cloudrun.conf.template`), so the login cookie works as in Kubernetes. woo-mcp stays on the
+HP next to the store, and only woo-mcp is published, through Tailscale Funnel; the store and its WooCommerce keys
+never leave the HP.
+(`gcp-deploy.sh` can also run woo-mcp on Cloud Run, for a store with its own public HTTPS address: see its header.)
+
+**1. On the HP: publish woo-mcp (once).**
+1. Make a free Tailscale account and do the three admin-console steps at the top of `tailscale-operator.sh`:
+   turn on MagicDNS and HTTPS certificates, add the tag and Funnel entries to the policy file, and make an OAuth client.
+2. Then run:
 ```bash
-scripts/gcp-secrets.sh    # once: the secrets (asks for the Groq key and the store's WooCommerce key pair, hidden)
-WOO_BASE_URL=https://<store> ADMIN_EMAIL=<you> scripts/gcp-deploy.sh   # build + deploy; run again after every change
-scripts/gcp-teardown.sh   # deletes the three services; secrets and images are kept
+scripts/tailscale-operator.sh   # asks for the OAuth client id and secret (hidden); installs Tailscale's operator
+# set publicMcp.enabled: true in deploy/helm/store/values-local.yaml, then:
+scripts/deploy-local.sh
+kubectl -n store-main get ingress woo-mcp-public     # ADDRESS: woo-mcp.<tailnet>.ts.net (after a minute)
+```
+3. Check it from any network:
+   - `curl -s -o /dev/null -w '%{http_code}\n' https://woo-mcp.<tailnet>.ts.net/mcp` should print `401`: reachable, but a token is required.
+   - `/wp-admin` at the same address should print `404`: that address leads to woo-mcp alone.
+
+**2. On the Mac: deploy.** You need `gcloud`, logged in (`gcloud auth login`), and a project with a billing account
+linked, because the free tiers still need one.
+```bash
+export WOO_MCP_URL=https://woo-mcp.<tailnet>.ts.net/mcp
+scripts/gcp-secrets.sh    # once: asks for the Groq key and the HP's woo-mcp token (hidden)
+ADMIN_EMAIL=<you> scripts/gcp-deploy.sh   # build + deploy; run again after every change
+scripts/gcp-observability.sh   # metrics, the dashboard and an uptime check on /health (free; see 4.)
+scripts/gcp-teardown.sh   # deletes the Cloud Run services and the uptime check; secrets and images are kept
 ```
 
 | Script | Does | Safety |
 |---|---|---|
-| `gcp-secrets.sh` | 5 Secret Manager secrets. `gateway-env` holds the gateway's secret key, admin key and LLM key as one file (`GATEWAY_SECRETS_FILE`). The others are the two MCP tokens and the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value creates nothing |
-| `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys woo-mcp, gst, then the gateway (its seed needs their URLs) | Checks every setting, billing and the secrets before changing anything |
-| `gcp-teardown.sh [--yes]` | Deletes the three Cloud Run services | Asks for `delete` to be typed |
+| `tailscale-operator.sh` (HP) | Stores the Tailscale OAuth client as the Secret `tailscale/operator-oauth`, then installs Tailscale's operator | The secret never goes on a command line (Helm gets no credentials); an existing Secret is kept; local cluster only |
+| `gcp-secrets.sh` | 3 Secret Manager secrets: `gateway-env` (the gateway's secret key, admin key, LLM key and the ADK agent's key as one file, `GATEWAY_SECRETS_FILE`) and the two MCP tokens. With woo-mcp on Cloud Run: 5, adding the WooCommerce key pair | Never overwrites a secret. Values never go on a command line or into output. A bad value, such as a token still in base64, creates nothing |
+| `gcp-deploy.sh` | Turns on the APIs; creates the budget alert, the image repository, the build bucket and a service account per service; runs Cloud Build; deploys gst, the gateway (its seed needs gst's URL), then the dashboard (it needs the gateway's); prints the dashboard's address | Checks every setting, billing and the secrets before changing anything |
+| `gcp-observability.sh` | Creates four logs-based metrics (`deploy/gcp/observability/metrics/`), the "MCP gateway" dashboard and an uptime check on `/health` | Needs the gateway deployed; makes nothing twice; creates no alert policies (they are billed) |
+| `gcp-teardown.sh [--yes]` | Deletes the Cloud Run services and the uptime check | Asks for `delete` to be typed |
+
+**What publishing woo-mcp means:** it's the only thing reachable from the internet, and it refuses requests without its
+token. The Tailscale proxy is wired to woo-mcp alone, so no `Host` header can reach the storefront or the dashboard,
+and woo-mcp's network rule admits only that proxy and the local gateway. The HP must be on for the woo tools to work;
+when it's off, the gateway's other tools keep working.
+
+**3. Optional: a Dialogflow CX agent that answers through the gateway.** CX is billed per request once its trial
+credit is used (about $0.007 per text request for a flow; check the pricing page first), so delete the CX agent after
+the demo. The webhook offers the model read-only tools only; `CX_TOOLS` narrows them further, for example to products
+and GST, before you put the agent on a public website.
+1. In the Conversational Agents (Dialogflow CX) console, create a flow-based agent.
+2. Manage > Webhooks > Create:
+   - URL: `https://<gateway>/api/cx/webhook` (`gcp-deploy.sh` prints it);
+   - timeout: 30 s;
+   - header: `Authorization: Bearer <CX_AGENT_KEY>`, read from `gateway-env` like the admin key.
+
+   It must be the CX member's key: the webhook refuses an admin's. If the console does not accept an `Authorization` header, tell me, and the gateway can take the key in another header.
+3. Default Start Flow > Start Page > event handler `sys.no-match-default` > fulfillment: call the webhook. Every message no route handles then goes to the gateway, and the conversation is kept in the session parameter `gw_history`.
+4. Try it in the simulator:
+   - "how much is the demo mug?" is looked up;
+   - "delete product 12" is politely refused, because no tool that changes anything is offered.
+
+   The calls show in the dashboard's audit page with source "cx".
+
+**4. Watching it.** `gcp-observability.sh` sets up:
+- **logs-based metrics:** tool calls by outcome, server, tool and source; latency; refused keys; CX turns;
+- **a dashboard** with those, plus Cloud Run's own request and instance charts;
+- **an uptime check** on `/health` every 15 minutes.
+
+All of it is free. There are no alert emails, because alert policies are billed per condition; the budget alert is the one notification. The metrics count log lines from the moment they exist, not earlier ones.
+
+The uptime check also keeps the gateway from idling long enough to stop, so its in-memory database rarely resets.
+
+For anything else, use Logs Explorer (Logging > Logs Explorer), or the same query with `gcloud logging read '<query>' --freshness=1h`:
+
+| To see | Query (add `resource.labels.service_name="gateway"` in front) |
+|---|---|
+| failed tool calls | `jsonPayload.event="tool_call" jsonPayload.outcome!="success"` |
+| refused API keys, and which key id | `jsonPayload.outcome="auth_failed"` |
+| one request's whole story | open any line > "Show entries for this trace" (every line carries its trace) |
+| CX conversations, by CX session id | `jsonPayload.event="cx_turn"` |
+| configuration changes (servers, users) | `jsonPayload.event="admin_event"` |
+| the latest lines | `gcloud run services logs read gateway --region=us-central1 --limit=50` |
+
+No line carries an API key, an email or a customer's words.
 
 **How it stays free:**
 - **Services:** no instance while idle, CPU only during requests, and a cap on instances.
-- **Secrets:** five secret values, inside Secret Manager's free six. Old versions are destroyed, because every version that isn't destroyed is billed.
+- **Secrets:** three secret values (five with woo-mcp on Cloud Run), inside Secret Manager's free six. Old versions are destroyed, because every version that isn't destroyed is billed.
 - **Images:** the 2 newest of each are kept, to stay under the free 0.5 GB.
-- **Builds:** run on Cloud Build's default machine. Uploads go to a regional bucket that deletes them after a day.
+- **Builds:** run on Cloud Build's default machine; woo-mcp is only built when it runs on Cloud Run. Uploads go to a regional bucket that deletes them after a day.
 - **Budget alert:** set to 1 unit of the billing account's currency. It only warns; it never stops spending.
 
 **The price of free (Kubernetes keeps all of these):**
@@ -97,7 +165,7 @@ Read the admin key when needed:
 
 ## Tests
 `scripts/tests/run.sh` (on the Mac; no cluster needed): the real scripts run against stand-ins for
-kubectl/docker/k3d/helm/rsync/gcloud, checking calls, order, safety checks and that no secret leaks.
+kubectl/docker/k3d/helm/rsync/gcloud/git, checking calls, order, safety checks and that no secret leaks.
 
 ## Before every push
 ```bash

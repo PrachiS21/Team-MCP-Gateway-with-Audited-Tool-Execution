@@ -34,6 +34,15 @@ networkPolicy:
     namespace: kube-system
     podLabels: { k8s-app: kube-dns }
 
+# Publish woo-mcp, and ONLY woo-mcp, on the internet through Tailscale Funnel, for a gateway that runs outside this
+# cluster (Cloud Run). Off by default: going public is a deliberate one-line change. Needs Tailscale's Kubernetes
+# operator in operatorNamespace (scripts/tailscale-operator.sh). The address becomes https://<hostname>.<tailnet>.ts.net
+# and woo-mcp still refuses any request without its MCP_SERVER_TOKEN. See templates/public-mcp.yaml.
+publicMcp:
+  enabled: false
+  hostname: woo-mcp               # first part of the public name
+  operatorNamespace: tailscale    # where the operator, and the proxy it runs for woo-mcp, live
+
 images:
   mariadb:   { repository: mariadb,   tag: "11",             pullPolicy: IfNotPresent }   # TODO pin an exact tag/digest (read it from the HP: docker image inspect)
   wordpress: { repository: wordpress, tag: 7.1.3-apache,     pullPolicy: IfNotPresent }
